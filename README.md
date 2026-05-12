@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hotgraph-logo.png" alt="Hotgraph logo" width="760">
+</p>
+
 # Hotgraph
 
 **Reality Graph: 4D Knowledge Graph - Rust**
