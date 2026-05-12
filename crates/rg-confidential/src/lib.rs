@@ -6,6 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rg_ai::EvidencePack;
 use rg_core::{SourceId, TenantId};
 
@@ -44,6 +46,7 @@ const EVENT_LOG_HEADER: &str = "RGCONF-EVENTLOG-V1";
 const SNAPSHOT_HEADER: &str = "RGCONF-SNAPSHOT-V1";
 const SOURCE_STORE_HEADER: &str = "RGCONF-SOURCESTORE-V1";
 const AUTH_TAG_BYTES: usize = 16;
+const XCHACHA20_NONCE_BYTES: usize = 24;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct TenantKey {
@@ -137,6 +140,249 @@ impl fmt::Display for ConfidentialError {
 impl std::error::Error for ConfidentialError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedDataKey {
+    pub key_id: KeyId,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KmsKeyMetadata {
+    pub key_id: KeyId,
+    pub provider: String,
+}
+
+pub trait KmsProvider: Clone {
+    fn create_data_key(
+        &self,
+        tenant_id: &str,
+        purpose: &str,
+    ) -> Result<([u8; 32], EncryptedDataKey), ConfidentialError>;
+
+    fn decrypt_data_key(
+        &self,
+        tenant_id: &str,
+        purpose: &str,
+        encrypted: &EncryptedDataKey,
+    ) -> Result<[u8; 32], ConfidentialError>;
+
+    fn rotate_key(&mut self, new_key_id: impl Into<String>) -> Result<KeyId, ConfidentialError>;
+    fn key_metadata(&self) -> KmsKeyMetadata;
+    fn health_check(&self) -> Result<(), ConfidentialError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalDevKmsProvider {
+    active_key_id: KeyId,
+    master_keys: BTreeMap<KeyId, [u8; 32]>,
+}
+
+impl LocalDevKmsProvider {
+    pub fn new(key_id: impl Into<String>) -> Self {
+        let key_id = KeyId::new(key_id);
+        let material = derive_local_kms_master_key(&key_id);
+        let mut master_keys = BTreeMap::new();
+        master_keys.insert(key_id.clone(), material);
+        Self {
+            active_key_id: key_id,
+            master_keys,
+        }
+    }
+}
+
+impl KmsProvider for LocalDevKmsProvider {
+    fn create_data_key(
+        &self,
+        tenant_id: &str,
+        purpose: &str,
+    ) -> Result<([u8; 32], EncryptedDataKey), ConfidentialError> {
+        let master = self
+            .master_keys
+            .get(&self.active_key_id)
+            .ok_or_else(|| ConfidentialError::MissingKey(self.active_key_id.clone()))?;
+        let data_key = derive_data_key(master, tenant_id, purpose);
+        Ok((
+            data_key,
+            EncryptedDataKey {
+                key_id: self.active_key_id.clone(),
+                ciphertext: wrap_data_key(master, tenant_id, purpose, &data_key),
+            },
+        ))
+    }
+
+    fn decrypt_data_key(
+        &self,
+        tenant_id: &str,
+        purpose: &str,
+        encrypted: &EncryptedDataKey,
+    ) -> Result<[u8; 32], ConfidentialError> {
+        let master = self
+            .master_keys
+            .get(&encrypted.key_id)
+            .ok_or_else(|| ConfidentialError::MissingKey(encrypted.key_id.clone()))?;
+        unwrap_data_key(master, tenant_id, purpose, &encrypted.ciphertext)
+    }
+
+    fn rotate_key(&mut self, new_key_id: impl Into<String>) -> Result<KeyId, ConfidentialError> {
+        let key_id = KeyId::new(new_key_id);
+        self.master_keys
+            .entry(key_id.clone())
+            .or_insert_with(|| derive_local_kms_master_key(&key_id));
+        self.active_key_id = key_id.clone();
+        Ok(key_id)
+    }
+
+    fn key_metadata(&self) -> KmsKeyMetadata {
+        KmsKeyMetadata {
+            key_id: self.active_key_id.clone(),
+            provider: "local-dev".to_owned(),
+        }
+    }
+
+    fn health_check(&self) -> Result<(), ConfidentialError> {
+        if self.master_keys.contains_key(&self.active_key_id) {
+            Ok(())
+        } else {
+            Err(ConfidentialError::MissingKey(self.active_key_id.clone()))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "aws-kms")]
+pub struct AwsKmsProvider {
+    key_id: KeyId,
+    region: String,
+}
+
+#[cfg(feature = "aws-kms")]
+impl AwsKmsProvider {
+    pub fn new(key_id: impl Into<String>, region: impl Into<String>) -> Self {
+        Self {
+            key_id: KeyId::new(key_id),
+            region: region.into(),
+        }
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+#[cfg(feature = "aws-kms")]
+impl KmsProvider for AwsKmsProvider {
+    fn create_data_key(
+        &self,
+        _tenant_id: &str,
+        _purpose: &str,
+    ) -> Result<([u8; 32], EncryptedDataKey), ConfidentialError> {
+        Err(ConfidentialError::Codec(
+            "AwsKmsProvider is a production adapter boundary; wire aws-sdk-kms in deployment code"
+                .to_owned(),
+        ))
+    }
+
+    fn decrypt_data_key(
+        &self,
+        _tenant_id: &str,
+        _purpose: &str,
+        _encrypted: &EncryptedDataKey,
+    ) -> Result<[u8; 32], ConfidentialError> {
+        Err(ConfidentialError::Codec(
+            "AwsKmsProvider is a production adapter boundary; wire aws-sdk-kms in deployment code"
+                .to_owned(),
+        ))
+    }
+
+    fn rotate_key(&mut self, new_key_id: impl Into<String>) -> Result<KeyId, ConfidentialError> {
+        self.key_id = KeyId::new(new_key_id);
+        Ok(self.key_id.clone())
+    }
+
+    fn key_metadata(&self) -> KmsKeyMetadata {
+        KmsKeyMetadata {
+            key_id: self.key_id.clone(),
+            provider: format!("aws-kms:{}", self.region),
+        }
+    }
+
+    fn health_check(&self) -> Result<(), ConfidentialError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedEnvelope {
+    pub algorithm: String,
+    pub encrypted_data_key: EncryptedDataKey,
+    pub nonce_hex: String,
+    pub associated_data: String,
+    pub ciphertext: Vec<u8>,
+    pub tag: [u8; AUTH_TAG_BYTES],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvelopeEncryptor<P: KmsProvider> {
+    kms: P,
+}
+
+impl<P: KmsProvider> EnvelopeEncryptor<P> {
+    pub fn new(kms: P) -> Self {
+        Self { kms }
+    }
+
+    pub fn encrypt(
+        &self,
+        tenant_id: &str,
+        purpose: &str,
+        plaintext: &[u8],
+    ) -> Result<EncryptedEnvelope, ConfidentialError> {
+        self.kms.health_check()?;
+        let (data_key, encrypted_data_key) = self.kms.create_data_key(tenant_id, purpose)?;
+        let nonce = derive_envelope_nonce(&data_key, tenant_id, purpose);
+        let associated_data = envelope_associated_data(tenant_id, purpose);
+        let (ciphertext, tag) =
+            aead_encrypt(&data_key, &nonce, associated_data.as_bytes(), plaintext)?;
+        Ok(EncryptedEnvelope {
+            algorithm: "XChaCha20Poly1305".to_owned(),
+            encrypted_data_key,
+            nonce_hex: hex_encode(&nonce),
+            associated_data,
+            ciphertext,
+            tag,
+        })
+    }
+
+    pub fn decrypt(
+        &self,
+        tenant_id: &str,
+        purpose: &str,
+        envelope: &EncryptedEnvelope,
+    ) -> Result<Vec<u8>, ConfidentialError> {
+        if envelope.algorithm != "XChaCha20Poly1305" {
+            return Err(ConfidentialError::Codec(format!(
+                "unsupported envelope algorithm {}",
+                envelope.algorithm
+            )));
+        }
+        let expected_associated_data = envelope_associated_data(tenant_id, purpose);
+        if envelope.associated_data != expected_associated_data {
+            return Err(ConfidentialError::AuthenticationFailed);
+        }
+        let data_key =
+            self.kms
+                .decrypt_data_key(tenant_id, purpose, &envelope.encrypted_data_key)?;
+        let nonce = decode_xchacha_nonce(&envelope.nonce_hex)?;
+        aead_decrypt(
+            &data_key,
+            &nonce,
+            expected_associated_data.as_bytes(),
+            &envelope.ciphertext,
+            &envelope.tag,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EncryptedRecordHeader {
     pub sequence: u64,
     pub key_id: KeyId,
@@ -184,7 +430,7 @@ impl EncryptedEventLog {
             sequence,
             "event-log",
             plaintext,
-        );
+        )?;
         let mut file = OpenOptions::new()
             .append(true)
             .open(&self.path)
@@ -225,12 +471,12 @@ impl EncryptedEventLog {
             .iter()
             .enumerate()
             .map(|(index, plaintext)| {
-                Ok(encrypt_record(
+                encrypt_record(
                     self.key_ring.active_key()?,
                     (index + 1) as u64,
                     "event-log",
                     plaintext,
-                ))
+                )
             })
             .collect::<Result<Vec<_>, ConfidentialError>>()?;
         write_event_records(&self.path, &rewritten)?;
@@ -273,7 +519,7 @@ impl EncryptedSnapshotStore {
         snapshot_name: impl Into<String>,
         plaintext: &[u8],
     ) -> Result<(), ConfidentialError> {
-        let record = encrypt_record(key_ring.active_key()?, 1, "snapshot", plaintext);
+        let record = encrypt_record(key_ring.active_key()?, 1, "snapshot", plaintext)?;
         let line = encode_snapshot_record(&snapshot_name.into(), &record);
         write_records(path.as_ref(), SNAPSHOT_HEADER, &[line])
     }
@@ -344,7 +590,7 @@ impl EncryptedSourceStore {
             + 1;
         entries.push((
             source_id,
-            encrypt_record(key_ring.active_key()?, sequence, "source-store", plaintext),
+            encrypt_record(key_ring.active_key()?, sequence, "source-store", plaintext)?,
         ));
         let lines = entries
             .iter()
@@ -387,15 +633,13 @@ impl EncryptedSourceStore {
             .map(|(index, (source_id, record))| {
                 from_key_ids.insert(record.header.key_id.clone());
                 let plaintext = decrypt_record(key_ring, record, "source-store")?;
-                Ok((
-                    source_id.clone(),
-                    encrypt_record(
-                        key_ring.active_key()?,
-                        (index + 1) as u64,
-                        "source-store",
-                        &plaintext,
-                    ),
-                ))
+                let encrypted = encrypt_record(
+                    key_ring.active_key()?,
+                    (index + 1) as u64,
+                    "source-store",
+                    &plaintext,
+                )?;
+                Ok((source_id.clone(), encrypted))
             })
             .collect::<Result<Vec<_>, ConfidentialError>>()?;
         let lines = rewritten
@@ -683,11 +927,12 @@ fn encrypt_record(
     sequence: u64,
     purpose: &str,
     plaintext: &[u8],
-) -> EncryptedRecord {
-    let nonce = derive_nonce(sequence, &key.id, purpose);
-    let ciphertext = xor_keystream(plaintext, key, &nonce);
-    let tag = auth_tag(key, &nonce, purpose.as_bytes(), &ciphertext);
-    EncryptedRecord {
+) -> Result<EncryptedRecord, ConfidentialError> {
+    let nonce = derive_record_nonce(sequence, &key.id, purpose);
+    let associated_data = record_associated_data(sequence, &key.id, purpose);
+    let (ciphertext, tag) =
+        aead_encrypt(&key.material, &nonce, associated_data.as_bytes(), plaintext)?;
+    Ok(EncryptedRecord {
         header: EncryptedRecordHeader {
             sequence,
             key_id: key.id.clone(),
@@ -695,7 +940,7 @@ fn encrypt_record(
         },
         ciphertext,
         tag,
-    }
+    })
 }
 
 fn decrypt_record(
@@ -704,26 +949,26 @@ fn decrypt_record(
     purpose: &str,
 ) -> Result<Vec<u8>, ConfidentialError> {
     let key = key_ring.key(&record.header.key_id)?;
-    let nonce_bytes = hex_decode(&record.header.nonce_hex)?;
-    if nonce_bytes.len() != 12 {
-        return Err(ConfidentialError::Codec(
-            "nonce must be 12 bytes".to_owned(),
-        ));
-    }
-    let mut nonce = [0_u8; 12];
-    nonce.copy_from_slice(&nonce_bytes);
-    let expected = auth_tag(key, &nonce, purpose.as_bytes(), &record.ciphertext);
-    if !constant_time_eq(&expected, &record.tag) {
-        return Err(ConfidentialError::AuthenticationFailed);
-    }
-    Ok(xor_keystream(&record.ciphertext, key, &nonce))
+    let nonce = decode_xchacha_nonce(&record.header.nonce_hex)?;
+    let associated_data = record_associated_data(record.header.sequence, &key.id, purpose);
+    aead_decrypt(
+        &key.material,
+        &nonce,
+        associated_data.as_bytes(),
+        &record.ciphertext,
+        &record.tag,
+    )
 }
 
-fn derive_nonce(sequence: u64, key_id: &KeyId, purpose: &str) -> [u8; 12] {
+fn derive_record_nonce(
+    sequence: u64,
+    key_id: &KeyId,
+    purpose: &str,
+) -> [u8; XCHACHA20_NONCE_BYTES] {
     let mut seed = stable_hash(0x8c7d_f2a9_d11a_7701, &sequence.to_le_bytes());
     seed = stable_hash(seed, key_id.as_str().as_bytes());
     seed = stable_hash(seed, purpose.as_bytes());
-    let mut nonce = [0_u8; 12];
+    let mut nonce = [0_u8; XCHACHA20_NONCE_BYTES];
     for (index, byte) in nonce.iter_mut().enumerate() {
         seed = splitmix64(seed ^ index as u64);
         *byte = (seed >> ((index % 8) * 8)) as u8;
@@ -731,39 +976,180 @@ fn derive_nonce(sequence: u64, key_id: &KeyId, purpose: &str) -> [u8; 12] {
     nonce
 }
 
-fn xor_keystream(input: &[u8], key: &TenantKey, nonce: &[u8; 12]) -> Vec<u8> {
-    input
-        .iter()
-        .enumerate()
-        .map(|(index, byte)| byte ^ stream_byte(key, nonce, index as u64))
-        .collect()
+fn derive_local_kms_master_key(key_id: &KeyId) -> [u8; 32] {
+    let mut seed = stable_hash(0x6a09_e667_f3bc_c909, key_id.as_str().as_bytes());
+    let mut material = [0_u8; 32];
+    for (index, byte) in material.iter_mut().enumerate() {
+        seed = splitmix64(seed ^ ((index as u64) << 32));
+        *byte = (seed >> ((index % 8) * 8)) as u8;
+    }
+    material
 }
 
-fn stream_byte(key: &TenantKey, nonce: &[u8; 12], index: u64) -> u8 {
-    let mut seed = stable_hash(0x243f_6a88_85a3_08d3 ^ index, &key.material);
-    seed = stable_hash(seed, nonce);
-    seed = splitmix64(seed ^ index.rotate_left(17));
-    (seed >> ((index % 8) * 8)) as u8
+fn derive_data_key(master: &[u8; 32], tenant_id: &str, purpose: &str) -> [u8; 32] {
+    let mut seed = stable_hash(0xbb67_ae85_84ca_a73b, master);
+    seed = stable_hash(seed, tenant_id.as_bytes());
+    seed = stable_hash(seed, purpose.as_bytes());
+    let mut material = [0_u8; 32];
+    for (index, byte) in material.iter_mut().enumerate() {
+        seed = splitmix64(seed ^ index as u64);
+        *byte = (seed >> ((index % 8) * 8)) as u8;
+    }
+    material
 }
 
-fn auth_tag(
-    key: &TenantKey,
-    nonce: &[u8; 12],
+fn wrap_data_key(
+    master: &[u8; 32],
+    tenant_id: &str,
+    purpose: &str,
+    data_key: &[u8; 32],
+) -> Vec<u8> {
+    let nonce = derive_kms_nonce(master, tenant_id, purpose);
+    let associated_data = local_kms_associated_data(tenant_id, purpose);
+    let (mut ciphertext, tag) = aead_encrypt(master, &nonce, associated_data.as_bytes(), data_key)
+        .expect("local development KMS wrapping uses valid fixed-size AEAD inputs");
+    ciphertext.extend_from_slice(&tag);
+    ciphertext
+}
+
+fn unwrap_data_key(
+    master: &[u8; 32],
+    tenant_id: &str,
+    purpose: &str,
+    encrypted: &[u8],
+) -> Result<[u8; 32], ConfidentialError> {
+    if encrypted.len() < AUTH_TAG_BYTES {
+        return Err(ConfidentialError::AuthenticationFailed);
+    }
+    let tag_offset = encrypted.len() - AUTH_TAG_BYTES;
+    let mut tag = [0_u8; AUTH_TAG_BYTES];
+    tag.copy_from_slice(&encrypted[tag_offset..]);
+    let nonce = derive_kms_nonce(master, tenant_id, purpose);
+    let associated_data = local_kms_associated_data(tenant_id, purpose);
+    let plaintext = aead_decrypt(
+        master,
+        &nonce,
+        associated_data.as_bytes(),
+        &encrypted[..tag_offset],
+        &tag,
+    )?;
+    if plaintext.len() != 32 {
+        return Err(ConfidentialError::Codec(
+            "decrypted data key must be 32 bytes".to_owned(),
+        ));
+    }
+    let mut data_key = [0_u8; 32];
+    data_key.copy_from_slice(&plaintext);
+    Ok(data_key)
+}
+
+fn derive_kms_nonce(
+    master: &[u8; 32],
+    tenant_id: &str,
+    purpose: &str,
+) -> [u8; XCHACHA20_NONCE_BYTES] {
+    let mut seed = stable_hash(0x3c6e_f372_fe94_f82b, master);
+    seed = stable_hash(seed, tenant_id.as_bytes());
+    seed = stable_hash(seed, purpose.as_bytes());
+    let mut nonce = [0_u8; XCHACHA20_NONCE_BYTES];
+    for (index, byte) in nonce.iter_mut().enumerate() {
+        seed = splitmix64(seed ^ (index as u64).rotate_left(11));
+        *byte = (seed >> ((index % 8) * 8)) as u8;
+    }
+    nonce
+}
+
+fn derive_envelope_nonce(
+    data_key: &[u8; 32],
+    tenant_id: &str,
+    purpose: &str,
+) -> [u8; XCHACHA20_NONCE_BYTES] {
+    let mut seed = stable_hash(0x510e_527f_ade6_82d1, data_key);
+    seed = stable_hash(seed, tenant_id.as_bytes());
+    seed = stable_hash(seed, purpose.as_bytes());
+    let mut nonce = [0_u8; XCHACHA20_NONCE_BYTES];
+    for (index, byte) in nonce.iter_mut().enumerate() {
+        seed = splitmix64(seed ^ (index as u64).rotate_left(7));
+        *byte = (seed >> ((index % 8) * 8)) as u8;
+    }
+    nonce
+}
+
+fn record_associated_data(sequence: u64, key_id: &KeyId, purpose: &str) -> String {
+    format!(
+        "record:v1;purpose={purpose};sequence={sequence};key_id={}",
+        key_id.as_str()
+    )
+}
+
+fn envelope_associated_data(tenant_id: &str, purpose: &str) -> String {
+    format!("envelope:v1;tenant={tenant_id};purpose={purpose}")
+}
+
+fn local_kms_associated_data(tenant_id: &str, purpose: &str) -> String {
+    format!("local-kms:v1;tenant={tenant_id};purpose={purpose}")
+}
+
+fn decode_xchacha_nonce(nonce_hex: &str) -> Result<[u8; XCHACHA20_NONCE_BYTES], ConfidentialError> {
+    let nonce_bytes = hex_decode(nonce_hex)?;
+    if nonce_bytes.len() != XCHACHA20_NONCE_BYTES {
+        return Err(ConfidentialError::Codec(format!(
+            "nonce must be {XCHACHA20_NONCE_BYTES} bytes"
+        )));
+    }
+    let mut nonce = [0_u8; XCHACHA20_NONCE_BYTES];
+    nonce.copy_from_slice(&nonce_bytes);
+    Ok(nonce)
+}
+
+fn aead_encrypt(
+    key_material: &[u8; 32],
+    nonce: &[u8; XCHACHA20_NONCE_BYTES],
+    associated_data: &[u8],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; AUTH_TAG_BYTES]), ConfidentialError> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key_material));
+    let mut sealed = cipher
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| ConfidentialError::AuthenticationFailed)?;
+    if sealed.len() < AUTH_TAG_BYTES {
+        return Err(ConfidentialError::Codec(
+            "AEAD ciphertext shorter than auth tag".to_owned(),
+        ));
+    }
+    let tag_offset = sealed.len() - AUTH_TAG_BYTES;
+    let tag_bytes = sealed.split_off(tag_offset);
+    let mut tag = [0_u8; AUTH_TAG_BYTES];
+    tag.copy_from_slice(&tag_bytes);
+    Ok((sealed, tag))
+}
+
+fn aead_decrypt(
+    key_material: &[u8; 32],
+    nonce: &[u8; XCHACHA20_NONCE_BYTES],
     associated_data: &[u8],
     ciphertext: &[u8],
-) -> [u8; AUTH_TAG_BYTES] {
-    let mut left = stable_hash(0x1319_8a2e_0370_7344, &key.material);
-    left = stable_hash(left, nonce);
-    left = stable_hash(left, associated_data);
-    left = stable_hash(left, ciphertext);
-    let mut right = stable_hash(0xa409_3822_299f_31d0, ciphertext);
-    right = stable_hash(right, associated_data);
-    right = stable_hash(right, nonce);
-    right = stable_hash(right, &key.material);
-    let mut tag = [0_u8; AUTH_TAG_BYTES];
-    tag[..8].copy_from_slice(&left.to_le_bytes());
-    tag[8..].copy_from_slice(&right.to_le_bytes());
-    tag
+    tag: &[u8; AUTH_TAG_BYTES],
+) -> Result<Vec<u8>, ConfidentialError> {
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key_material));
+    let mut sealed = Vec::with_capacity(ciphertext.len() + tag.len());
+    sealed.extend_from_slice(ciphertext);
+    sealed.extend_from_slice(tag);
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: &sealed,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| ConfidentialError::AuthenticationFailed)
 }
 
 fn encode_event_record(record: &EncryptedRecord) -> String {
@@ -955,18 +1341,6 @@ fn required<'a>(
         .get(index)
         .map(String::as_str)
         .ok_or_else(|| ConfidentialError::Codec(format!("missing {field}")))
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |accumulator, (left, right)| {
-            accumulator | (*left ^ *right)
-        })
-        == 0
 }
 
 fn io_error(error: std::io::Error) -> ConfidentialError {

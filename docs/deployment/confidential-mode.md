@@ -9,9 +9,10 @@ no-raw-source mode, and privacy-preserving analytics interfaces.
 ## Security Posture
 
 The MVP crate is an integration boundary, not a complete compliance program.
-Production deployments should replace local test key material with KMS, HSM, or
-confidential-compute key release, and should run regular restore, redaction, and
-access-control drills.
+It now uses AEAD record encryption and a cloud-neutral KMS envelope boundary.
+Production deployments must replace local development key material with AWS KMS,
+another cloud KMS, an HSM, or confidential-compute key release, and should run
+regular restore, redaction, and access-control drills.
 
 Core rules:
 
@@ -23,6 +24,21 @@ Core rules:
 - Treat privacy analytics as aggregate output only; exact small-group counts are
   suppressed.
 - Log key rotation, snapshot restore, and evidence redaction decisions.
+
+## KMS Providers
+
+Current providers:
+
+- `LocalDevKmsProvider`: deterministic local provider for tests, fixtures, and
+  development only. It must not protect production data.
+- `AwsKmsProvider`: production adapter boundary behind the `aws-kms` feature.
+  It defines metadata, rotation, and health-check shape, but deployment code must
+  wire AWS SDK calls, IAM/workload identity, and region-specific policy before a
+  hosted production claim.
+
+Encrypted envelopes store the algorithm, encrypted data key, key ID, nonce,
+associated data, ciphertext, and authentication tag. Wrong keys, tampering, and
+wrong associated data fail closed.
 
 ## Air-Gapped Deployment
 
@@ -100,7 +116,7 @@ encrypted restore are stable.
 
 Roadmap:
 
-1. Add a KMS-backed `KeyProvider` trait with envelope encryption.
+1. Wire the `AwsKmsProvider` boundary to the AWS SDK with workload identity.
 2. Add attested key release for confidential VMs or enclaves.
 3. Bind event-log and snapshot decryption to measured boot claims.
 4. Add remote attestation evidence to health checks and deployment status.
@@ -122,6 +138,7 @@ Confidential-compute constraints:
 Before using confidential mode with sensitive data:
 
 - Run `cargo test -p rg-confidential --test confidential_mode`.
+- Verify AEAD tamper, wrong-key, wrong-associated-data, and key-rotation tests.
 - Write and restore an encrypted event log.
 - Write and restore an encrypted snapshot.
 - Rotate keys and verify old records remain readable through retained keys.

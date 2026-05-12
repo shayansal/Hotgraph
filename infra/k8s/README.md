@@ -13,7 +13,13 @@ These manifests define a production-shaped starter deployment:
 - PodDisruptionBudgets for API and Qdrant
 - ClusterIP Services and an optional NGINX Ingress
 
-The API uses a single file-backed event log PVC in this starter manifest, so the API Deployment is pinned to one replica. Move `RG_EVENT_LOG_PATH` to a shared production log service before scaling API replicas horizontally. The worker currently runs the same `rg-api` image on port `8081` and exposes the same health/metrics endpoints. Replace its command/image when a dedicated ingestion worker binary is added.
+The API uses a single-writer redb file plus local append/audit logs on one PVC in
+this starter manifest, so the API Deployment is pinned to one replica and sets
+`HOTGRAPH_NODE_ROLE=writer`. Do not scale writers horizontally until follower
+tailing, write proxying, lease failover, and split-brain prevention have passed
+their production gates. The worker currently runs the same `rg-api` image on port
+`8081` and exposes the same health/metrics endpoints. Replace its command/image
+when a dedicated ingestion worker binary is added.
 
 ## Build And Push Image
 
@@ -72,7 +78,7 @@ Health endpoints:
 
 ## Backups And Restore
 
-`backup-cronjob.yaml` copies the API WAL and idempotency log from the API PVC
+`backup-cronjob.yaml` copies the API redb database, WAL, and idempotency log from the API PVC
 to `reality-graph-api-backups` every 15 minutes and writes SHA-256 sums beside
 each backup. This is a starter cluster-local backup only; production deployments
 must mirror these artifacts to object storage or a managed backup service.
@@ -81,7 +87,7 @@ Restore is intentionally manual:
 
 1. Scale `deployment/reality-graph-api` to zero.
 2. Choose a backup directory from `reality-graph-api-backups`.
-3. Restore `events.log` and `idempotency.log` into `reality-graph-api-data`.
+3. Restore `hotgraph.redb`, `events.log`, and `idempotency.log` into `reality-graph-api-data`.
 4. Start a one-shot restore verification job or run the API locally against the
    restored PVC.
 5. Compare state hash, event checksum, and post-restore query parity.

@@ -46,6 +46,10 @@ spec:
                   name: reality-graph-secrets
                   key: RG_API_KEYS
                   optional: false
+            - name: HOTGRAPH_NODE_ROLE
+              value: writer
+            - name: RG_REDB_PATH
+              value: /var/lib/reality-graph/hotgraph.redb
             - name: RG_EVENT_LOG_PATH
               value: /var/lib/reality-graph/events.log
             - name: RG_IDEMPOTENCY_LOG_PATH

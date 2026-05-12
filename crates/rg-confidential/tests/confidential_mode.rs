@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use rg_ai::{EvidencePack, SourceExcerpt};
 use rg_confidential::{
     AnalyticsMetric, AnalyticsObservation, ConfidentialQueryPolicy, EncryptedEventLog,
-    EncryptedSnapshotStore, EncryptedSourceStore, KeyId, KeyRing, PrivacyAnalyticsQuery,
-    PrivateAnalyticsEngine, RedactionAwareQueryEngine, TenantKey,
+    EncryptedSnapshotStore, EncryptedSourceStore, EnvelopeEncryptor, KeyId, KeyRing,
+    LocalDevKmsProvider, PrivacyAnalyticsQuery, PrivateAnalyticsEngine, RedactionAwareQueryEngine,
+    TenantKey,
 };
 use rg_core::{
     Assertion, AssertionId, AssertionStatus, Confidence, ContentHash, ContextScope, Entity,
@@ -58,6 +59,43 @@ fn encrypted_event_log_round_trips_without_plaintext_leakage() {
     );
 
     fs::remove_file(path).expect("cleanup");
+}
+
+#[test]
+fn envelope_encryptor_detects_tamper_wrong_key_and_wrong_associated_data() {
+    let encryptor = EnvelopeEncryptor::new(LocalDevKmsProvider::new("dev-master"));
+    let envelope = encryptor
+        .encrypt("tenant-a", "event-log", b"source-backed secret")
+        .expect("encrypt envelope");
+
+    assert_eq!(envelope.algorithm, "XChaCha20Poly1305");
+    assert_eq!(envelope.encrypted_data_key.key_id, KeyId::new("dev-master"));
+    assert!(!envelope.ciphertext.is_empty());
+    assert_ne!(envelope.ciphertext, b"source-backed secret");
+    assert_eq!(
+        encryptor
+            .decrypt("tenant-a", "event-log", &envelope)
+            .expect("decrypt envelope"),
+        b"source-backed secret"
+    );
+
+    let mut tampered = envelope.clone();
+    tampered.ciphertext[0] ^= 0x80;
+    assert!(matches!(
+        encryptor.decrypt("tenant-a", "event-log", &tampered),
+        Err(rg_confidential::ConfidentialError::AuthenticationFailed)
+    ));
+
+    assert!(matches!(
+        encryptor.decrypt("tenant-a", "snapshot", &envelope),
+        Err(rg_confidential::ConfidentialError::AuthenticationFailed)
+    ));
+
+    let wrong_encryptor = EnvelopeEncryptor::new(LocalDevKmsProvider::new("other-master"));
+    assert!(matches!(
+        wrong_encryptor.decrypt("tenant-a", "event-log", &envelope),
+        Err(rg_confidential::ConfidentialError::MissingKey(_))
+    ));
 }
 
 #[test]

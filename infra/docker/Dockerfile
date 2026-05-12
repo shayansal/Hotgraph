@@ -25,6 +25,8 @@ RUN groupadd --system --gid 10001 realitygraph \
 COPY --from=builder /workspace/target/release/rg-api /usr/local/bin/rg-api
 
 ENV RG_API_ADDR=0.0.0.0:8080
+ENV HOTGRAPH_NODE_ROLE=writer
+ENV RG_REDB_PATH=/var/lib/reality-graph/hotgraph.redb
 ENV RG_EVENT_LOG_PATH=/var/lib/reality-graph/events.log
 ENV RG_IDEMPOTENCY_LOG_PATH=/var/lib/reality-graph/idempotency.log
 ENV RUST_LOG=info

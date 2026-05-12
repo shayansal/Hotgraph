@@ -29,7 +29,10 @@ use rg_ingest::{
 use rg_query::{
     EntityPattern, GraphQuery, ObjectPattern, PathQuery, PredicatePattern, QueryEngine, QueryResult,
 };
-use rg_storage::{FileEventLog, InMemoryStorage, RedbGraphStore, StorageError, WalAppendMetadata};
+use rg_storage::{
+    DurableAssertionQuery, FileEventLog, InMemoryStorage, RedbGraphStore, StorageError,
+    WalAppendMetadata,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
@@ -42,12 +45,58 @@ const DEFAULT_MAX_QUERY_LIMIT: usize = 1000;
 const DEFAULT_MAX_PATH_DEPTH: usize = 8;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NodeRole {
+    Writer,
+    Reader {
+        writer_url: String,
+        max_lag_lsn: Option<u64>,
+    },
+}
+
+impl NodeRole {
+    fn from_env() -> Result<Self, ApiConfigError> {
+        match std::env::var("HOTGRAPH_NODE_ROLE") {
+            Ok(value) if value.eq_ignore_ascii_case("reader") => {
+                let writer_url = std::env::var("HOTGRAPH_WRITER_URL").map_err(|_| {
+                    ApiConfigError::new("HOTGRAPH_WRITER_URL is required for reader nodes")
+                })?;
+                if writer_url.trim().is_empty() {
+                    return Err(ApiConfigError::new(
+                        "HOTGRAPH_WRITER_URL is required for reader nodes",
+                    ));
+                }
+                let max_lag_lsn = std::env::var("HOTGRAPH_READER_MAX_LAG_LSN")
+                    .ok()
+                    .map(|value| {
+                        value.parse::<u64>().map_err(|error| {
+                            ApiConfigError::new(format!(
+                                "HOTGRAPH_READER_MAX_LAG_LSN must be a non-negative integer: {error}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                Ok(Self::Reader {
+                    writer_url,
+                    max_lag_lsn,
+                })
+            }
+            Ok(value) if value.eq_ignore_ascii_case("writer") => Ok(Self::Writer),
+            Ok(value) => Err(ApiConfigError::new(format!(
+                "HOTGRAPH_NODE_ROLE must be writer or reader, got {value}"
+            ))),
+            Err(_) => Ok(Self::Writer),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ApiState {
     log: Arc<Mutex<EventLog>>,
     storage: Arc<Mutex<InMemoryStorage>>,
     durable_log: Option<Arc<Mutex<FileEventLog>>>,
     durable_store: Option<Arc<Mutex<RedbGraphStore>>>,
+    node_role: NodeRole,
     auth: Arc<AuthConfig>,
     idempotency: Arc<Mutex<BTreeMap<String, IdempotencyRecord>>>,
     idempotency_path: Option<Arc<PathBuf>>,
@@ -67,6 +116,7 @@ impl ApiState {
             storage: Arc::new(Mutex::new(InMemoryStorage::new())),
             durable_log: None,
             durable_store: None,
+            node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
@@ -87,6 +137,7 @@ impl ApiState {
             storage: Arc::new(Mutex::new(storage)),
             durable_log: None,
             durable_store: None,
+            node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
@@ -110,6 +161,7 @@ impl ApiState {
             storage: Arc::new(Mutex::new(storage)),
             durable_log: Some(Arc::new(Mutex::new(file_log))),
             durable_store: None,
+            node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
@@ -141,6 +193,7 @@ impl ApiState {
             storage: Arc::new(Mutex::new(storage)),
             durable_log: None,
             durable_store: Some(Arc::new(Mutex::new(store))),
+            node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
@@ -162,6 +215,7 @@ impl ApiState {
         } else {
             Self::new_in_memory()
         };
+        state.node_role = NodeRole::from_env()?;
         if state.durable_log.is_none()
             && state.durable_store.is_none()
             && configured_replica_count()? > 1
@@ -250,6 +304,11 @@ impl ApiState {
         command: GraphCommand,
         idempotency_key: Option<String>,
     ) -> Result<rg_events::GraphEvent, ApiError> {
+        if let NodeRole::Reader { writer_url, .. } = &self.node_role {
+            return Err(ApiError::writer_required(format!(
+                "reader nodes do not acknowledge local writes; send the request to {writer_url}"
+            )));
+        }
         let start = Instant::now();
         let fingerprint = format!("{command:?}");
         if let Some(key) = &idempotency_key {
@@ -388,6 +447,20 @@ impl ApiState {
     }
 
     fn metrics_snapshot(&self) -> Result<MetricsResponse, ApiError> {
+        if let Some(durable_store) = &self.durable_store {
+            let counts = durable_store
+                .lock()
+                .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+                .counts()
+                .map_err(ApiError::from)?;
+            return Ok(MetricsResponse {
+                entities: counts.entities,
+                assertions: counts.assertions,
+                sources: counts.sources,
+                events: counts.events,
+                agent_memories: counts.memories,
+            });
+        }
         let storage = self.storage_snapshot()?;
         Ok(MetricsResponse {
             entities: storage.graph_state().entities.len(),
@@ -396,6 +469,20 @@ impl ApiState {
             events: storage.events().len(),
             agent_memories: storage.graph_state().agent_memories.len(),
         })
+    }
+
+    fn execute_graph_query(&self, query: GraphQuery) -> Result<Vec<QueryResult>, ApiError> {
+        if let Some(durable_store) = &self.durable_store {
+            let query = durable_query_from_graph_query(&query);
+            let assertions = durable_store
+                .lock()
+                .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+                .query_assertions(&query)
+                .map_err(ApiError::from)?;
+            return Ok(assertions.iter().map(QueryResult::from_assertion).collect());
+        }
+        let storage = self.storage_snapshot()?;
+        Ok(QueryEngine::from_storage(storage).execute_graph(query))
     }
 
     fn health_snapshot(&self) -> Result<HealthResponse, ApiError> {
@@ -1235,13 +1322,11 @@ async fn execute_query(
     Json(request): Json<GraphQueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let start = Instant::now();
-    let storage = state.storage_snapshot()?;
-    let engine = QueryEngine::from_storage(storage);
-    let results = engine
-        .execute_graph(graph_query_from_request(
+    let results = state
+        .execute_graph_query(graph_query_from_request(
             state.apply_query_limits(request)?,
             context.tenant_context(),
-        )?)
+        )?)?
         .iter()
         .map(QueryResultResponse::from)
         .collect();
@@ -1868,6 +1953,14 @@ impl ApiError {
         }
     }
 
+    fn writer_required(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "writer_required",
+            message: message.into(),
+        }
+    }
+
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -1921,6 +2014,27 @@ impl TryFrom<GraphQueryRequest> for GraphQuery {
 
     fn try_from(request: GraphQueryRequest) -> Result<Self, Self::Error> {
         graph_query_from_request(request, None)
+    }
+}
+
+fn durable_query_from_graph_query(query: &GraphQuery) -> DurableAssertionQuery {
+    DurableAssertionQuery {
+        subject: query.subject.as_ref().map(|pattern| match pattern {
+            EntityPattern::Id(id) => id.clone(),
+        }),
+        predicate: query.predicate.as_ref().map(|pattern| match pattern {
+            PredicatePattern::Id(id) => id.clone(),
+        }),
+        object: query.object.as_ref().map(|pattern| match pattern {
+            ObjectPattern::Entity(id) => GraphValue::Entity(id.clone()),
+            ObjectPattern::Value(value) => value.clone(),
+        }),
+        source: None,
+        valid_at: query.valid_at.map(ValidTime::new),
+        known_at: query.known_at.map(TxTime::new),
+        context: query.context.clone(),
+        min_confidence: query.min_confidence,
+        limit: query.limit,
     }
 }
 
@@ -2696,5 +2810,64 @@ mod tests {
         assert_eq!(restarted.metrics_snapshot().expect("metrics").events, 1);
 
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn production_reader_role_requires_writer_url() {
+        let previous_keys = std::env::var("RG_API_KEYS").ok();
+        let previous_dev = std::env::var("HOTGRAPH_DEV_AUTH_DISABLED").ok();
+        let previous_role = std::env::var("HOTGRAPH_NODE_ROLE").ok();
+        let previous_writer_url = std::env::var("HOTGRAPH_WRITER_URL").ok();
+
+        std::env::set_var(
+            "RG_API_KEYS",
+            "reader-secret:reader-service:tenant-default:reader",
+        );
+        std::env::remove_var("HOTGRAPH_DEV_AUTH_DISABLED");
+        std::env::set_var("HOTGRAPH_NODE_ROLE", "reader");
+        std::env::remove_var("HOTGRAPH_WRITER_URL");
+
+        let error = ApiState::from_env().expect_err("reader without writer URL must fail");
+
+        assert!(error
+            .to_string()
+            .contains("HOTGRAPH_WRITER_URL is required for reader nodes"));
+
+        restore_env("RG_API_KEYS", previous_keys);
+        restore_env("HOTGRAPH_DEV_AUTH_DISABLED", previous_dev);
+        restore_env("HOTGRAPH_NODE_ROLE", previous_role);
+        restore_env("HOTGRAPH_WRITER_URL", previous_writer_url);
+    }
+
+    #[test]
+    fn reader_role_rejects_local_writes_with_stable_error_code() {
+        let mut state = ApiState::new_in_memory();
+        state.node_role = NodeRole::Reader {
+            writer_url: "http://hotgraph-writer:8080".to_owned(),
+            max_lag_lsn: Some(10),
+        };
+        let command = GraphCommand::AddSource(AddSource {
+            id: SourceId::new("reader-source"),
+            source_type: SourceType::Document,
+            uri: None,
+            content_hash: rg_core::ContentHash::new("sha256:reader-source"),
+            trust_score: None,
+        });
+
+        let error = state
+            .execute(command, Some("reader-source-once".to_owned()))
+            .expect_err("reader must not acknowledge local write");
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "writer_required");
+        assert!(error.message.contains("http://hotgraph-writer:8080"));
+    }
+
+    fn restore_env(name: &str, value: Option<String>) {
+        if let Some(value) = value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
     }
 }

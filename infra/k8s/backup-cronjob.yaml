@@ -39,8 +39,11 @@ spec:
                   ts="$(date -u +%Y%m%dT%H%M%SZ)"
                   target="/backup/${ts}"
                   mkdir -p "${target}"
-                  test -f /data/events.log
-                  cp /data/events.log "${target}/events.log"
+                  test -f /data/hotgraph.redb
+                  cp /data/hotgraph.redb "${target}/hotgraph.redb"
+                  if [ -f /data/events.log ]; then
+                    cp /data/events.log "${target}/events.log"
+                  fi
                   if [ -f /data/idempotency.log ]; then
                     cp /data/idempotency.log "${target}/idempotency.log"
                   fi

@@ -293,6 +293,29 @@ pub struct DurableHealth {
     pub writer_lease: Option<WriterLease>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DurableAssertionQuery {
+    pub subject: Option<EntityId>,
+    pub predicate: Option<PredicateId>,
+    pub object: Option<GraphValue>,
+    pub source: Option<SourceId>,
+    pub valid_at: Option<ValidTime>,
+    pub known_at: Option<TxTime>,
+    pub context: Option<ContextScope>,
+    pub min_confidence: Option<f32>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DurableCounts {
+    pub events: usize,
+    pub entities: usize,
+    pub assertions: usize,
+    pub sources: usize,
+    pub memories: usize,
+    pub causal_links: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MigrationRecord {
     pub version: u32,
@@ -325,6 +348,11 @@ pub trait DurableGraphStore {
         end_lsn: u64,
     ) -> Result<Vec<(u64, GraphEvent)>, StorageError>;
     fn materialized_storage(&self) -> Result<InMemoryStorage, StorageError>;
+    fn query_assertions(
+        &self,
+        query: &DurableAssertionQuery,
+    ) -> Result<Vec<Assertion>, StorageError>;
+    fn counts(&self) -> Result<DurableCounts, StorageError>;
     fn health(&self) -> Result<DurableHealth, StorageError>;
 }
 
@@ -465,6 +493,35 @@ impl RedbGraphStore {
 
     pub fn source(&self, id: &SourceId) -> Result<Option<Source>, StorageError> {
         self.read_string_table(REDB_SOURCES, id.as_str(), decode_source)
+    }
+
+    pub fn query_assertions(
+        &self,
+        query: &DurableAssertionQuery,
+    ) -> Result<Vec<Assertion>, StorageError> {
+        let ids = self.candidate_assertion_ids(query)?;
+        let mut assertions = ids
+            .into_iter()
+            .filter_map(|id| self.assertion(&id).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        assertions.retain(|assertion| durable_query_matches(assertion, query));
+        assertions.sort_by(|left, right| left.id.cmp(&right.id));
+        assertions.dedup_by(|left, right| left.id == right.id);
+        if let Some(limit) = query.limit {
+            assertions.truncate(limit);
+        }
+        Ok(assertions)
+    }
+
+    pub fn counts(&self) -> Result<DurableCounts, StorageError> {
+        Ok(DurableCounts {
+            events: self.count_u64_table(REDB_EVENTS)?,
+            entities: self.count_str_table(REDB_ENTITIES)?,
+            assertions: self.count_str_table(REDB_ASSERTIONS)?,
+            sources: self.count_str_table(REDB_SOURCES)?,
+            memories: self.count_str_table(REDB_MEMORIES)?,
+            causal_links: self.count_str_table(REDB_CAUSAL_LINKS)?,
+        })
     }
 
     pub fn idempotency_lsn(&self, key: &str) -> Result<Option<u64>, StorageError> {
@@ -635,6 +692,105 @@ impl RedbGraphStore {
         Ok(Some(decoded.event))
     }
 
+    fn candidate_assertion_ids(
+        &self,
+        query: &DurableAssertionQuery,
+    ) -> Result<Vec<AssertionId>, StorageError> {
+        if let Some(subject) = &query.subject {
+            return self.assertion_ids_for_index_key(REDB_INDEX_SUBJECT, subject.as_str());
+        }
+        if let Some(predicate) = &query.predicate {
+            return self.assertion_ids_for_index_key(REDB_INDEX_PREDICATE, predicate.as_str());
+        }
+        if let Some(object) = &query.object {
+            return self
+                .assertion_ids_for_index_key(REDB_INDEX_OBJECT, &encode_graph_value(object));
+        }
+        if let Some(source) = &query.source {
+            return self.assertion_ids_for_index_key(REDB_INDEX_SOURCE, source.as_str());
+        }
+        if let Some(context) = &query.context {
+            return self
+                .assertion_ids_for_index_key(REDB_INDEX_CONTEXT, &encode_context_scope(context));
+        }
+        if let Some(valid_at) = query.valid_at {
+            return self.assertion_ids_for_time_index(REDB_INDEX_VALID_TIME, valid_at.as_i64());
+        }
+        if let Some(known_at) = query.known_at {
+            return self.assertion_ids_for_time_index(REDB_INDEX_TX_TIME, known_at.as_i64());
+        }
+        self.all_assertion_ids()
+    }
+
+    fn assertion_ids_for_index_key(
+        &self,
+        table: TableDefinition<'static, &str, &[u8]>,
+        key: &str,
+    ) -> Result<Vec<AssertionId>, StorageError> {
+        self.read_string_table(table, key, decode_assertion_id_list)?
+            .map_or_else(|| Ok(Vec::new()), Ok)
+    }
+
+    fn assertion_ids_for_time_index(
+        &self,
+        table: TableDefinition<'static, &str, &[u8]>,
+        instant: i64,
+    ) -> Result<Vec<AssertionId>, StorageError> {
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let table = read_txn.open_table(table).map_err(redb_error)?;
+        let mut ids = Vec::new();
+        for row in table.iter().map_err(redb_error)? {
+            let (key, value) = row.map_err(redb_error)?;
+            let start = parse_i64(key.value())?;
+            if start <= instant {
+                ids.extend(decode_assertion_id_list(&bytes_to_string(value.value())?)?);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    fn all_assertion_ids(&self) -> Result<Vec<AssertionId>, StorageError> {
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let table = read_txn.open_table(REDB_ASSERTIONS).map_err(redb_error)?;
+        let mut ids = Vec::new();
+        for row in table.iter().map_err(redb_error)? {
+            let (key, _) = row.map_err(redb_error)?;
+            ids.push(AssertionId::new(key.value()));
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    fn count_u64_table(
+        &self,
+        table: TableDefinition<'static, u64, &[u8]>,
+    ) -> Result<usize, StorageError> {
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let table = read_txn.open_table(table).map_err(redb_error)?;
+        let mut count = 0;
+        for row in table.iter().map_err(redb_error)? {
+            row.map_err(redb_error)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn count_str_table(
+        &self,
+        table: TableDefinition<'static, &str, &[u8]>,
+    ) -> Result<usize, StorageError> {
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let table = read_txn.open_table(table).map_err(redb_error)?;
+        let mut count = 0;
+        for row in table.iter().map_err(redb_error)? {
+            row.map_err(redb_error)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn read_metadata_string(&self, key: &str) -> Result<Option<String>, StorageError> {
         self.read_string_table(REDB_METADATA, key, |record| Ok(record.to_owned()))
     }
@@ -688,6 +844,17 @@ impl DurableGraphStore for RedbGraphStore {
 
     fn materialized_storage(&self) -> Result<InMemoryStorage, StorageError> {
         Self::materialized_storage(self)
+    }
+
+    fn query_assertions(
+        &self,
+        query: &DurableAssertionQuery,
+    ) -> Result<Vec<Assertion>, StorageError> {
+        Self::query_assertions(self, query)
+    }
+
+    fn counts(&self) -> Result<DurableCounts, StorageError> {
+        Self::counts(self)
     }
 
     fn health(&self) -> Result<DurableHealth, StorageError> {
@@ -966,6 +1133,42 @@ fn decode_writer_lease(record: &str) -> Result<WriterLease, StorageError> {
         fencing_token: parse_u64(required(&parts, 1, "writer lease fencing token")?)?,
         expires_at_ms: parse_i64(required(&parts, 2, "writer lease expiry")?)?,
     })
+}
+
+fn decode_assertion_id_list(record: &str) -> Result<Vec<AssertionId>, StorageError> {
+    decode_parts(record).map(|parts| parts.into_iter().map(AssertionId::new).collect())
+}
+
+fn durable_query_matches(assertion: &Assertion, query: &DurableAssertionQuery) -> bool {
+    query
+        .subject
+        .as_ref()
+        .map_or(true, |subject| &assertion.subject == subject)
+        && query
+            .predicate
+            .as_ref()
+            .map_or(true, |predicate| &assertion.predicate == predicate)
+        && query
+            .object
+            .as_ref()
+            .map_or(true, |object| &assertion.object == object)
+        && query
+            .source
+            .as_ref()
+            .map_or(true, |source| assertion.source_ids.contains(source))
+        && query
+            .valid_at
+            .map_or(true, |instant| assertion.valid_time.contains(instant))
+        && query
+            .known_at
+            .map_or(true, |instant| assertion.transaction_time.contains(instant))
+        && query
+            .context
+            .as_ref()
+            .map_or(true, |context| &assertion.context == context)
+        && query
+            .min_confidence
+            .map_or(true, |minimum| assertion.confidence.as_f32() >= minimum)
 }
 
 fn bytes_to_string(bytes: &[u8]) -> Result<String, StorageError> {
@@ -3495,6 +3698,58 @@ mod tests {
         assert_eq!(range[0].1, events[1]);
         assert_eq!(range[1].0, 3);
         assert_eq!(range[1].1, events[2]);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn redb_graph_store_queries_assertions_from_durable_indexes() {
+        let path = temp_file("redb-query-indexes");
+        let events = sample_events();
+        let mut store = RedbGraphStore::create(&path).expect("create redb store");
+        for event in &events {
+            store.append_event(event, None).expect("append event");
+        }
+
+        let query = DurableAssertionQuery {
+            subject: Some(EntityId::new("person-a")),
+            predicate: Some(PredicateId::new("works_at")),
+            object: Some(GraphValue::Entity(EntityId::new("company-b"))),
+            source: Some(SourceId::new("source-1")),
+            valid_at: Some(ValidTime::new(15)),
+            known_at: Some(TxTime::new(4)),
+            context: Some(ContextScope::Global),
+            min_confidence: Some(0.9),
+            limit: Some(10),
+        };
+
+        let assertions = store
+            .query_assertions(&query)
+            .expect("query durable assertions");
+
+        assert_eq!(assertions.len(), 1);
+        assert_eq!(assertions[0].id, AssertionId::new("assertion-1"));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn redb_graph_store_reports_counts_from_materialized_tables() {
+        let path = temp_file("redb-counts");
+        let events = sample_events();
+        let mut store = RedbGraphStore::create(&path).expect("create redb store");
+        for event in &events {
+            store.append_event(event, None).expect("append event");
+        }
+
+        let counts = store.counts().expect("read durable counts");
+
+        assert_eq!(counts.events, 4);
+        assert_eq!(counts.entities, 2);
+        assert_eq!(counts.assertions, 1);
+        assert_eq!(counts.sources, 1);
+        assert_eq!(counts.memories, 0);
+        assert_eq!(counts.causal_links, 0);
 
         fs::remove_file(path).expect("cleanup");
     }
