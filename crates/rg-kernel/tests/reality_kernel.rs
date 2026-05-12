@@ -4,16 +4,18 @@ use rg_core::{
     AgentId, Confidence, EventId, PredicateId, SourceId, TenantId, TimeInterval, TxTime, ValidTime,
 };
 use rg_kernel::{
-    AiUsage, AtomId, AtomImpactReport, BeliefState, BitemporalQuestion, BitemporalTruth,
-    CausalAtom, ClaimPattern, ClaimType, ConflictSet, ConflictStatus, ConflictType, DependencyEdge,
-    DependencyGraph, DependencyNode, DependencyType, EntityRef, EvidenceSpan, ExtractionTrace,
-    IncrementalComputation, IncrementalEventKind, KernelError, KernelEvent, MaintainedViewName,
+    active_during, current_belief, dispute_atom, known_at, retract_atom, revise_belief,
+    supersede_atom, visible_at, AiUsage, AtomId, AtomImpactReport, AtomPattern, BeliefPolicy,
+    BeliefState, BitemporalQuestion, BitemporalTruth, CausalAtom, ClaimPattern, ClaimType,
+    ConflictSet, ConflictStatus, ConflictType, DependencyEdge, DependencyGraph, DependencyNode,
+    DependencyType, EntityRef, EvidenceSpan, ExtractionTrace, ImpactCone, IncrementalComputation,
+    IncrementalEventKind, KernelError, KernelEvent, KernelQuery, MaintainedViewName,
     ModelContextCompiler, ModelContextRequest, NativeExecutionStrategy, NativeRealityQuery,
-    PermissionLabel, PhysicalGraphStore, PhysicalLayoutKind, RealityAtom, RealityKernel,
-    RealityOperator, RealityQuery, RealityQueryVm, RealityReturnField, RecommendedActionKind,
-    RiskLevel, SelfRevisionCursor, SelfRevisionEngine, SelfRevisionJob, SelfRevisionPolicy,
-    SelfRevisionReviewStatus, SelfRevisionSuggestionKind, SourceRef, TaintLabel, TruthMaintenance,
-    ValueOrEntity,
+    PermissionLabel, PhysicalGraphStore, PhysicalLayoutKind, RealityAtom, RealityAtomId,
+    RealityKernel, RealityOperator, RealityQuery, RealityQueryVm, RealityReturnField,
+    RecommendedActionKind, RevisionReason, RiskLevel, SelfRevisionCursor, SelfRevisionEngine,
+    SelfRevisionJob, SelfRevisionPolicy, SelfRevisionReviewStatus, SelfRevisionSuggestionKind,
+    SourceRef, SupportSet, TaintLabel, TransactionTime, TruthMaintenance, ValueOrEntity,
 };
 
 #[test]
@@ -35,6 +37,126 @@ fn bitemporal_visibility_requires_valid_time_transaction_time_and_provenance() {
     .confidence(Confidence::new(0.9).expect("confidence"));
 
     assert_eq!(missing_source.build(), Err(KernelError::MissingProvenance));
+}
+
+#[test]
+fn week_one_kernel_invariants_are_enforced_by_builder() {
+    let reality_atom_id = RealityAtomId::new("atom-distinct");
+    let atom_id: AtomId = reality_atom_id.clone();
+    assert_eq!(atom_id.as_str(), "atom-distinct");
+    assert_eq!(TransactionTime::new(42).as_i64(), 42);
+
+    let derived_without_dependencies = RealityAtom::builder(
+        AtomId::new("derived-missing-dependencies"),
+        EntityRef::new("person-a"),
+        PredicateId::new("CURRENT_EMPLOYMENT_BELIEF"),
+        ValueOrEntity::entity("company-b"),
+    )
+    .valid_time(TimeInterval::new(ValidTime::new(2024), None).expect("valid"))
+    .transaction_time(TimeInterval::new(TxTime::new(200), None).expect("tx"))
+    .claim_type(ClaimType::Derived)
+    .belief_state(BeliefState::Accepted)
+    .confidence(Confidence::new(0.84).expect("confidence"))
+    .source_ref(SourceRef::new(SourceId::new("source-derived")))
+    .evidence_span(EvidenceSpan::new(
+        SourceId::new("source-derived"),
+        0,
+        24,
+        "derived from source atom",
+    ))
+    .tenant_id(TenantId::new("tenant-lab"))
+    .permissions(PermissionLabel::Internal)
+    .taint(TaintLabel::Trusted)
+    .ai_usage(AiUsage::SafeForPlanning { caveat: None });
+
+    assert_eq!(
+        derived_without_dependencies.build(),
+        Err(KernelError::MissingDependencies)
+    );
+
+    let memory_without_trace = RealityAtom::builder(
+        AtomId::new("memory-missing-trace"),
+        EntityRef::new("agent-research"),
+        PredicateId::new("HAS_MEMORY"),
+        ValueOrEntity::text("remembered without trace"),
+    )
+    .valid_time(TimeInterval::new(ValidTime::new(2024), None).expect("valid"))
+    .transaction_time(TimeInterval::new(TxTime::new(200), None).expect("tx"))
+    .claim_type(ClaimType::AgentMemory)
+    .belief_state(BeliefState::Accepted)
+    .confidence(Confidence::new(0.75).expect("confidence"))
+    .source_ref(SourceRef::new(SourceId::new("source-memory")))
+    .evidence_span(EvidenceSpan::new(
+        SourceId::new("source-memory"),
+        0,
+        24,
+        "memory write accepted",
+    ))
+    .tenant_id(TenantId::new("tenant-lab"))
+    .agent_scope(AgentId::new("agent-research"))
+    .permissions(PermissionLabel::Internal)
+    .taint(TaintLabel::Trusted)
+    .ai_usage(AiUsage::SafeForPlanning { caveat: None });
+
+    assert_eq!(
+        memory_without_trace.build(),
+        Err(KernelError::MissingMemoryTrace)
+    );
+}
+
+#[test]
+fn week_two_named_bitemporal_and_belief_apis_are_available() {
+    let atom = worked_at_atom(
+        "atom-week-two",
+        2021,
+        Some(2025),
+        100,
+        Some("source-week-two"),
+    );
+    let active_interval =
+        TimeInterval::new(ValidTime::new(2022), Some(ValidTime::new(2024))).expect("valid");
+
+    assert!(visible_at(
+        &atom,
+        ValidTime::new(2023),
+        TransactionTime::new(150)
+    ));
+    assert!(known_at(&atom, TransactionTime::new(150)));
+    assert!(active_during(&atom, &active_interval));
+
+    let view = current_belief(
+        std::slice::from_ref(&atom),
+        ValidTime::new(2023),
+        TransactionTime::new(150),
+        BeliefPolicy::IncludeDisputed,
+    );
+    assert_eq!(view.accepted_atoms, vec![atom.id.clone()]);
+    assert!(view.disputed_atoms.is_empty());
+
+    let reason = RevisionReason::new(TransactionTime::new(250), "newer source corrected range");
+    assert_eq!(
+        revise_belief(
+            atom.id.clone(),
+            AtomId::new("atom-week-two-replacement"),
+            reason.clone()
+        )
+        .next,
+        BeliefState::Superseded
+    );
+    assert_eq!(
+        supersede_atom(
+            atom.id.clone(),
+            AtomId::new("atom-week-two-replacement"),
+            reason.clone()
+        )
+        .known_at,
+        TxTime::new(250)
+    );
+    assert_eq!(
+        dispute_atom(atom.id.clone(), reason.clone()).next,
+        BeliefState::Disputed
+    );
+    assert_eq!(retract_atom(atom.id, reason).next, BeliefState::Retracted);
 }
 
 #[test]
@@ -623,6 +745,135 @@ fn source_false_collapse_query_categorizes_beliefs_memories_plans_answers_and_si
 }
 
 #[test]
+fn week_three_support_conflict_and_impact_apis_explain_truth_maintenance() {
+    let mut kernel = RealityKernel::new();
+    kernel.insert_atom(source_atom("source-payroll"));
+    kernel.insert_atom(
+        worked_at_atom(
+            "claim-worked-at",
+            2021,
+            Some(2025),
+            100,
+            Some("source-payroll"),
+        )
+        .depending_on(vec![AtomId::new("source-payroll")]),
+    );
+    kernel.insert_atom(
+        derived_belief_atom("summary-current-employment")
+            .depending_on(vec![AtomId::new("claim-worked-at")]),
+    );
+    kernel.add_dependency(
+        DependencyNode::Atom(AtomId::new("summary-current-employment")),
+        DependencyNode::Answer("answer-employment".to_owned()),
+        "answer quoted summary",
+    );
+    kernel.insert_atom(
+        worked_at_atom(
+            "claim-worked-at-conflict",
+            2022,
+            Some(2023),
+            120,
+            Some("source-conflict"),
+        )
+        .with_confidence(Confidence::new(0.52).expect("confidence")),
+    );
+    kernel.add_conflict(ConflictSet::new(
+        "conflict-worked-at",
+        vec![
+            AtomId::new("claim-worked-at"),
+            AtomId::new("claim-worked-at-conflict"),
+        ],
+        ConflictType::SourceDisagreement,
+        ConflictStatus::Unresolved,
+        "conflicting employment range",
+    ));
+
+    let support: SupportSet = kernel
+        .explain_support(&AtomId::new("claim-worked-at"))
+        .expect("support exists");
+    assert_eq!(support.atom_id.as_str(), "claim-worked-at");
+    assert!(support
+        .supporting_atoms
+        .contains(&AtomId::new("source-payroll")));
+    assert!(support
+        .source_ids
+        .contains(&SourceId::new("source-payroll")));
+    assert!(!support.evidence.is_empty());
+
+    let conflicts = kernel.explain_conflict(&AtomId::new("claim-worked-at"));
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].id, "conflict-worked-at");
+
+    let downstream = kernel.compute_downstream_dependencies(&AtomId::new("source-payroll"));
+    assert!(downstream.contains(&DependencyNode::Atom(AtomId::new("claim-worked-at"))));
+    assert!(downstream.contains(&DependencyNode::Atom(AtomId::new(
+        "summary-current-employment"
+    ))));
+    assert!(downstream.contains(&DependencyNode::Answer("answer-employment".to_owned())));
+
+    let impact: ImpactCone = kernel.compute_impact_if_retracted(&AtomId::new("source-payroll"));
+    assert!(impact
+        .impacted_atoms
+        .contains(&AtomId::new("summary-current-employment")));
+    assert!(impact
+        .impacted_answers
+        .contains(&"answer-employment".to_owned()));
+    assert!(!impact.invalidation_trace.steps.is_empty());
+}
+
+#[test]
+fn summaries_do_not_leak_permissioned_sources_into_ai_context() {
+    let mut kernel = RealityKernel::new();
+    let mut restricted = worked_at_atom(
+        "atom-restricted-source",
+        2021,
+        None,
+        100,
+        Some("source-restricted"),
+    );
+    restricted.permissions = PermissionLabel::Restricted;
+    kernel.insert_atom(restricted);
+    let mut public_summary = summary_atom(
+        "summary-public-over-restricted",
+        vec![AtomId::new("atom-restricted-source")],
+    );
+    public_summary.permissions = PermissionLabel::Public;
+    kernel.insert_atom(public_summary);
+
+    assert!(!kernel.summary_is_permission_safe(
+        &AtomId::new("summary-public-over-restricted"),
+        &[PermissionLabel::Public]
+    ));
+    assert_eq!(
+        kernel.summary_permission_leaks(
+            &AtomId::new("summary-public-over-restricted"),
+            &[PermissionLabel::Public]
+        ),
+        vec![AtomId::new("atom-restricted-source")]
+    );
+
+    let context = ModelContextCompiler::new(&kernel).compile(
+        ModelContextRequest::new(
+            "summarize public employment context",
+            AgentId::new("agent-web"),
+        )
+        .valid_at(ValidTime::new(2024))
+        .known_at(TxTime::new(200))
+        .permission_scope(vec![PermissionLabel::Public])
+        .token_budget(512),
+    );
+
+    assert!(context
+        .permission_filtered_atoms
+        .contains(&AtomId::new("summary-public-over-restricted")));
+    assert!(!context
+        .evidence_pack
+        .atoms
+        .iter()
+        .any(|atom| atom.id.as_str() == "summary-public-over-restricted"));
+}
+
+#[test]
 fn causal_atoms_are_first_class_and_require_evidence() {
     let mut kernel = RealityKernel::new();
     let atom = causal_atom(
@@ -1086,6 +1337,98 @@ fn native_reasoning_vm_what_breaks_if_false_classifies_affected_state() {
         .execution_trace
         .iter()
         .any(|step| step.operator == "DependencyInvalidation"));
+}
+
+#[test]
+fn week_four_kernel_query_ast_supports_named_variants_and_metadata_results() {
+    let mut kernel = RealityKernel::new();
+    kernel.insert_atom(source_atom("source-kernel-query"));
+    kernel.insert_atom(
+        worked_at_atom(
+            "atom-query-worked",
+            2021,
+            Some(2025),
+            100,
+            Some("source-kernel-query"),
+        )
+        .depending_on(vec![AtomId::new("source-kernel-query")]),
+    );
+    kernel.insert_atom(
+        worked_at_atom(
+            "atom-query-conflict",
+            2022,
+            Some(2023),
+            120,
+            Some("source-query-conflict"),
+        )
+        .with_confidence(Confidence::new(0.5).expect("confidence")),
+    );
+    kernel.add_conflict(ConflictSet::new(
+        "conflict-query",
+        vec![
+            AtomId::new("atom-query-worked"),
+            AtomId::new("atom-query-conflict"),
+        ],
+        ConflictType::ValidTimeOverlap,
+        ConflictStatus::Unresolved,
+        "query fixture conflict",
+    ));
+
+    let vm = RealityQueryVm::new(&kernel);
+    let get_result = vm.execute_kernel(KernelQuery::GetAtom(AtomId::new("atom-query-worked")));
+    assert_eq!(get_result.atom_ids, vec![AtomId::new("atom-query-worked")]);
+    assert_eq!(
+        get_result.beliefs,
+        vec![(AtomId::new("atom-query-worked"), BeliefState::Disputed)]
+    );
+    assert_eq!(
+        get_result.evidence_ids,
+        vec![SourceId::new("source-kernel-query")]
+    );
+
+    let visible_result = vm.execute_kernel(KernelQuery::VisibleAt {
+        valid_at: ValidTime::new(2022),
+        known_at: TransactionTime::new(200),
+        pattern: AtomPattern::new()
+            .subject(EntityRef::new("person-a"))
+            .predicate(PredicateId::new("WORKED_AT")),
+    });
+    assert!(visible_result
+        .atom_ids
+        .contains(&AtomId::new("atom-query-worked")));
+    assert!(visible_result
+        .atom_ids
+        .contains(&AtomId::new("atom-query-conflict")));
+    assert!(visible_result
+        .valid_times
+        .contains_key(&AtomId::new("atom-query-worked")));
+    assert!(visible_result
+        .transaction_times
+        .contains_key(&AtomId::new("atom-query-worked")));
+
+    let support = vm.execute_kernel(KernelQuery::ExplainSupport {
+        atom_id: AtomId::new("atom-query-worked"),
+    });
+    assert!(support
+        .support
+        .expect("support")
+        .supporting_atoms
+        .contains(&AtomId::new("source-kernel-query")));
+
+    let conflict = vm.execute_kernel(KernelQuery::ExplainConflict {
+        atom_id: AtomId::new("atom-query-worked"),
+    });
+    assert_eq!(conflict.conflicts.len(), 1);
+
+    let impact = vm.execute_kernel(KernelQuery::ImpactIfRetracted {
+        atom_id: AtomId::new("source-kernel-query"),
+        max_depth: 4,
+    });
+    assert!(impact
+        .impact
+        .expect("impact")
+        .impacted_atoms
+        .contains(&AtomId::new("atom-query-worked")));
 }
 
 #[test]
@@ -1884,6 +2227,7 @@ fn derived_belief_atom(id: &str) -> RealityAtom {
         28,
         "derived employment belief",
     ))
+    .dependencies(vec![AtomId::new("source-employment")])
     .tenant_id(TenantId::new("tenant-lab"))
     .permissions(PermissionLabel::Internal)
     .taint(TaintLabel::Trusted)
@@ -1910,6 +2254,10 @@ fn plan_atom(id: &str, content: &str) -> RealityAtom {
         0,
         20,
         "plan write accepted",
+    ))
+    .extraction_trace(ExtractionTrace::new(
+        "deterministic-fixture",
+        "memory-write",
     ))
     .tenant_id(TenantId::new("tenant-lab"))
     .agent_scope(AgentId::new("agent-research"))
@@ -1938,6 +2286,10 @@ fn memory_atom(id: &str, content: &str) -> RealityAtom {
         0,
         22,
         "memory write accepted",
+    ))
+    .extraction_trace(ExtractionTrace::new(
+        "deterministic-fixture",
+        "memory-write",
     ))
     .tenant_id(TenantId::new("tenant-lab"))
     .agent_scope(AgentId::new("agent-research"))

@@ -33,8 +33,44 @@ macro_rules! string_newtype {
     };
 }
 
-string_newtype!(AtomId);
+string_newtype!(RealityAtomId);
+pub type AtomId = RealityAtomId;
 string_newtype!(EntityRef);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TransactionTime(TxTime);
+
+impl TransactionTime {
+    pub fn new(value: i64) -> Self {
+        Self(TxTime::new(value))
+    }
+
+    pub fn as_i64(self) -> i64 {
+        self.0.as_i64()
+    }
+
+    pub fn as_tx_time(self) -> TxTime {
+        self.0
+    }
+}
+
+impl From<TxTime> for TransactionTime {
+    fn from(value: TxTime) -> Self {
+        Self(value)
+    }
+}
+
+impl From<TransactionTime> for TxTime {
+    fn from(value: TransactionTime) -> Self {
+        value.0
+    }
+}
+
+impl fmt::Display for TransactionTime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0.as_i64())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValueOrEntity {
@@ -260,6 +296,96 @@ impl RealityAtom {
     }
 }
 
+pub fn visible_at(atom: &RealityAtom, valid_at: ValidTime, known_at: TransactionTime) -> bool {
+    atom.is_visible_at(valid_at, known_at.into())
+}
+
+pub fn known_at(atom: &RealityAtom, known_at: TransactionTime) -> bool {
+    atom.transaction_time.contains(known_at.into())
+}
+
+pub fn active_during(atom: &RealityAtom, interval: &TimeInterval<ValidTime>) -> bool {
+    atom.valid_time.overlaps(interval)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BeliefPolicy {
+    AcceptedOnly,
+    IncludeDisputed,
+    IncludeSuperseded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeliefView {
+    pub valid_at: ValidTime,
+    pub known_at: TransactionTime,
+    pub accepted_atoms: Vec<AtomId>,
+    pub disputed_atoms: Vec<AtomId>,
+    pub superseded_atoms: Vec<AtomId>,
+    pub rejected_atoms: Vec<AtomId>,
+    pub visible_atoms: Vec<AtomId>,
+}
+
+pub fn current_belief(
+    atoms: &[RealityAtom],
+    valid_at: ValidTime,
+    known_at: TransactionTime,
+    policy: BeliefPolicy,
+) -> BeliefView {
+    let mut accepted_atoms = Vec::new();
+    let mut disputed_atoms = Vec::new();
+    let mut superseded_atoms = Vec::new();
+    let mut rejected_atoms = Vec::new();
+    let mut visible_atoms = Vec::new();
+
+    for atom in atoms
+        .iter()
+        .filter(|atom| visible_at(atom, valid_at, known_at))
+    {
+        match atom.belief_state {
+            BeliefState::Accepted => {
+                accepted_atoms.push(atom.id.clone());
+                visible_atoms.push(atom.id.clone());
+            }
+            BeliefState::Disputed => {
+                disputed_atoms.push(atom.id.clone());
+                if matches!(
+                    policy,
+                    BeliefPolicy::IncludeDisputed | BeliefPolicy::IncludeSuperseded
+                ) {
+                    visible_atoms.push(atom.id.clone());
+                }
+            }
+            BeliefState::Superseded => {
+                superseded_atoms.push(atom.id.clone());
+                if matches!(policy, BeliefPolicy::IncludeSuperseded) {
+                    visible_atoms.push(atom.id.clone());
+                }
+            }
+            BeliefState::Retracted | BeliefState::Refuted => {
+                rejected_atoms.push(atom.id.clone());
+            }
+            BeliefState::Candidate | BeliefState::Simulated | BeliefState::Unknown => {}
+        }
+    }
+
+    sort_and_dedup_atom_ids(&mut accepted_atoms);
+    sort_and_dedup_atom_ids(&mut disputed_atoms);
+    sort_and_dedup_atom_ids(&mut superseded_atoms);
+    sort_and_dedup_atom_ids(&mut rejected_atoms);
+    sort_and_dedup_atom_ids(&mut visible_atoms);
+
+    BeliefView {
+        valid_at,
+        known_at,
+        accepted_atoms,
+        disputed_atoms,
+        superseded_atoms,
+        rejected_atoms,
+        visible_atoms,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelContextScope {
     Global,
@@ -419,6 +545,12 @@ impl RealityAtomBuilder {
         if self.source_refs.is_empty() || self.evidence_spans.is_empty() {
             return Err(KernelError::MissingProvenance);
         }
+        if matches!(self.claim_type, ClaimType::Derived) && self.dependencies.is_empty() {
+            return Err(KernelError::MissingDependencies);
+        }
+        if matches!(self.claim_type, ClaimType::AgentMemory) && self.extraction_trace.is_none() {
+            return Err(KernelError::MissingMemoryTrace);
+        }
         if matches!(self.claim_type, ClaimType::Simulation)
             && !matches!(self.belief_state, BeliefState::Simulated)
         {
@@ -458,6 +590,8 @@ pub enum KernelError {
     MissingTransactionTime,
     MissingProvenance,
     MissingConfidence,
+    MissingDependencies,
+    MissingMemoryTrace,
     SimulationLabeledAsFact,
     InvalidDependencyStrength,
     UnknownAtom(AtomId),
@@ -474,6 +608,12 @@ impl fmt::Display for KernelError {
             }
             Self::MissingProvenance => formatter.write_str("reality atoms require provenance"),
             Self::MissingConfidence => formatter.write_str("reality atoms require confidence"),
+            Self::MissingDependencies => {
+                formatter.write_str("derived reality atoms require dependencies")
+            }
+            Self::MissingMemoryTrace => {
+                formatter.write_str("agent memory atoms require an extraction/write trace")
+            }
             Self::SimulationLabeledAsFact => {
                 formatter.write_str("simulation atoms must not be labeled as fact")
             }
@@ -542,6 +682,59 @@ pub struct BeliefRevision {
     pub previous: BeliefState,
     pub next: BeliefState,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevisionReason {
+    pub known_at: TransactionTime,
+    pub description: String,
+}
+
+impl RevisionReason {
+    pub fn new(known_at: TransactionTime, description: impl Into<String>) -> Self {
+        Self {
+            known_at,
+            description: description.into(),
+        }
+    }
+}
+
+pub fn revise_belief(old_atom: AtomId, new_atom: AtomId, reason: RevisionReason) -> BeliefRevision {
+    supersede_atom(old_atom, new_atom, reason)
+}
+
+pub fn supersede_atom(
+    old_atom: AtomId,
+    new_atom: AtomId,
+    reason: RevisionReason,
+) -> BeliefRevision {
+    BeliefRevision {
+        atom_id: old_atom,
+        known_at: reason.known_at.into(),
+        previous: BeliefState::Accepted,
+        next: BeliefState::Superseded,
+        reason: format!("{}; superseded by {new_atom}", reason.description),
+    }
+}
+
+pub fn dispute_atom(atom_id: AtomId, reason: RevisionReason) -> BeliefRevision {
+    BeliefRevision {
+        atom_id,
+        known_at: reason.known_at.into(),
+        previous: BeliefState::Accepted,
+        next: BeliefState::Disputed,
+        reason: reason.description,
+    }
+}
+
+pub fn retract_atom(atom_id: AtomId, reason: RevisionReason) -> BeliefRevision {
+    BeliefRevision {
+        atom_id,
+        known_at: reason.known_at.into(),
+        previous: BeliefState::Accepted,
+        next: BeliefState::Retracted,
+        reason: reason.description,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -761,6 +954,27 @@ impl TruthMaintenance {
             reason: reason.into(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SupportSet {
+    pub atom_id: AtomId,
+    pub supporting_atoms: Vec<AtomId>,
+    pub source_ids: Vec<SourceId>,
+    pub evidence: Vec<EvidenceSpan>,
+    pub dependency_trace: Vec<DependencyStep>,
+}
+
+pub type InvalidationTrace = InvalidationReport;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImpactCone {
+    pub root: AtomId,
+    pub impacted_atoms: Vec<AtomId>,
+    pub impacted_answers: Vec<String>,
+    pub impacted_simulations: Vec<String>,
+    pub invalidation_trace: InvalidationTrace,
+    pub warning: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2540,6 +2754,48 @@ impl ClaimPattern {
     }
 }
 
+pub type AtomPattern = ClaimPattern;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum KernelQuery {
+    GetAtom(AtomId),
+    FindAtoms(AtomPattern),
+    VisibleAt {
+        valid_at: ValidTime,
+        known_at: TransactionTime,
+        pattern: AtomPattern,
+    },
+    ExplainSupport {
+        atom_id: AtomId,
+    },
+    ExplainConflict {
+        atom_id: AtomId,
+    },
+    ImpactIfRetracted {
+        atom_id: AtomId,
+        max_depth: usize,
+    },
+    EntityState {
+        entity_id: EntityRef,
+        valid_at: ValidTime,
+        known_at: TransactionTime,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KernelQueryResult {
+    pub atom_ids: Vec<AtomId>,
+    pub evidence_ids: Vec<SourceId>,
+    pub beliefs: Vec<(AtomId, BeliefState)>,
+    pub valid_times: BTreeMap<AtomId, TimeInterval<ValidTime>>,
+    pub transaction_times: BTreeMap<AtomId, TimeInterval<TxTime>>,
+    pub dependency_trace: Vec<DependencyStep>,
+    pub atoms: Vec<RealityAtom>,
+    pub conflicts: Vec<ConflictSet>,
+    pub support: Option<SupportSet>,
+    pub impact: Option<ImpactCone>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RealityOperator {
     ValidAt(ValidTime),
@@ -2890,7 +3146,10 @@ impl<'a> ModelContextCompiler<'a> {
             if !model_context_time_visible(atom, &request) {
                 continue;
             }
-            if !model_context_permission_visible(atom, &request.permission_scope) {
+            if !self
+                .kernel
+                .atom_visible_with_permissions(atom, &request.permission_scope)
+            {
                 permission_filtered_atoms.push(atom.id.clone());
                 continue;
             }
@@ -3191,6 +3450,125 @@ impl RealityKernel {
 
     pub fn add_dependency_edge(&mut self, edge: DependencyEdge) -> Result<(), KernelError> {
         self.dependencies.add_dependency_edge(edge)
+    }
+
+    pub fn explain_support(&self, atom_id: &AtomId) -> Option<SupportSet> {
+        let atom = self.atoms.get(atom_id)?;
+        let mut supporting_atoms = atom.dependencies.clone();
+        sort_and_dedup_atom_ids(&mut supporting_atoms);
+
+        let mut source_ids = atom
+            .source_refs
+            .iter()
+            .map(|source_ref| source_ref.source_id.clone())
+            .collect::<Vec<_>>();
+        let mut evidence = atom.evidence_spans.clone();
+        for supporting_atom_id in &supporting_atoms {
+            if let Some(supporting_atom) = self.atoms.get(supporting_atom_id) {
+                source_ids.extend(
+                    supporting_atom
+                        .source_refs
+                        .iter()
+                        .map(|source_ref| source_ref.source_id.clone()),
+                );
+                evidence.extend(supporting_atom.evidence_spans.iter().cloned());
+            }
+        }
+        source_ids.sort();
+        source_ids.dedup();
+        evidence.sort_by(|left, right| {
+            left.source_id
+                .cmp(&right.source_id)
+                .then_with(|| left.start.cmp(&right.start))
+                .then_with(|| left.end.cmp(&right.end))
+                .then_with(|| left.quote.cmp(&right.quote))
+        });
+        evidence.dedup();
+
+        Some(SupportSet {
+            atom_id: atom_id.clone(),
+            supporting_atoms,
+            source_ids,
+            evidence,
+            dependency_trace: self
+                .dependencies
+                .trace_from(&DependencyNode::Atom(atom_id.clone())),
+        })
+    }
+
+    pub fn explain_conflict(&self, atom_id: &AtomId) -> Vec<ConflictSet> {
+        let mut conflicts = self
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.atom_ids.iter().any(|id| id == atom_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        conflicts.sort_by(|left, right| left.id.cmp(&right.id));
+        conflicts
+    }
+
+    pub fn compute_downstream_dependencies(&self, atom_id: &AtomId) -> Vec<DependencyNode> {
+        self.dependencies
+            .transitive_dependents(&DependencyNode::Atom(atom_id.clone()))
+    }
+
+    pub fn compute_impact_if_retracted(&self, atom_id: &AtomId) -> ImpactCone {
+        let report = self.impact_if_retracted(atom_id);
+        let root = DependencyNode::Atom(atom_id.clone());
+        let invalidation_trace =
+            TruthMaintenance::new(self.dependencies.clone()).invalidate(root, "atom retracted");
+        ImpactCone {
+            root: report.root,
+            impacted_atoms: report.impacted_atoms,
+            impacted_answers: report.impacted_answers,
+            impacted_simulations: report.impacted_simulations,
+            invalidation_trace,
+            warning: report.warning,
+        }
+    }
+
+    pub fn summary_permission_leaks(
+        &self,
+        summary_id: &AtomId,
+        permission_scope: &[PermissionLabel],
+    ) -> Vec<AtomId> {
+        let Some(summary) = self.atoms.get(summary_id) else {
+            return Vec::new();
+        };
+        if !matches!(summary.claim_type, ClaimType::Summary) {
+            return Vec::new();
+        }
+
+        let mut leaks = summary
+            .dependencies
+            .iter()
+            .filter_map(|dependency| {
+                let upstream = self.atoms.get(dependency)?;
+                (!permission_scope_allows(&upstream.permissions, permission_scope))
+                    .then(|| dependency.clone())
+            })
+            .collect::<Vec<_>>();
+        sort_and_dedup_atom_ids(&mut leaks);
+        leaks
+    }
+
+    pub fn summary_is_permission_safe(
+        &self,
+        summary_id: &AtomId,
+        permission_scope: &[PermissionLabel],
+    ) -> bool {
+        self.summary_permission_leaks(summary_id, permission_scope)
+            .is_empty()
+    }
+
+    pub fn atom_visible_with_permissions(
+        &self,
+        atom: &RealityAtom,
+        permission_scope: &[PermissionLabel],
+    ) -> bool {
+        permission_scope_allows(&atom.permissions, permission_scope)
+            && (!matches!(atom.claim_type, ClaimType::Summary)
+                || self.summary_is_permission_safe(&atom.id, permission_scope))
     }
 
     pub fn belief_at(&self, atom_id: &AtomId, known_at: TxTime) -> Option<BeliefState> {
@@ -3635,6 +4013,103 @@ impl<'a> RealityQueryVm<'a> {
         }
     }
 
+    pub fn execute_kernel(&self, query: KernelQuery) -> KernelQueryResult {
+        match query {
+            KernelQuery::GetAtom(atom_id) => {
+                let mut result = KernelQueryResult::default();
+                if let Some(atom) = self.kernel.atom(&atom_id).cloned() {
+                    self.push_kernel_result_atom(&mut result, atom);
+                }
+                result
+            }
+            KernelQuery::FindAtoms(pattern) => {
+                let mut result = KernelQueryResult::default();
+                for atom in self.kernel_atoms_matching(&pattern) {
+                    self.push_kernel_result_atom(&mut result, (*atom).clone());
+                }
+                self.sort_kernel_result(&mut result);
+                result
+            }
+            KernelQuery::VisibleAt {
+                valid_at,
+                known_at,
+                pattern,
+            } => {
+                let mut result = KernelQueryResult::default();
+                for atom in self
+                    .kernel_atoms_matching(&pattern)
+                    .into_iter()
+                    .filter(|atom| visible_at(atom, valid_at, known_at))
+                {
+                    self.push_kernel_result_atom(&mut result, (*atom).clone());
+                }
+                self.sort_kernel_result(&mut result);
+                result
+            }
+            KernelQuery::ExplainSupport { atom_id } => {
+                let mut result = KernelQueryResult::default();
+                if let Some(atom) = self.kernel.atom(&atom_id).cloned() {
+                    self.push_kernel_result_atom(&mut result, atom);
+                }
+                result.support = self.kernel.explain_support(&atom_id);
+                if let Some(support) = &result.support {
+                    result
+                        .dependency_trace
+                        .extend(support.dependency_trace.iter().cloned());
+                }
+                self.sort_kernel_result(&mut result);
+                result
+            }
+            KernelQuery::ExplainConflict { atom_id } => {
+                let mut result = KernelQueryResult::default();
+                if let Some(atom) = self.kernel.atom(&atom_id).cloned() {
+                    self.push_kernel_result_atom(&mut result, atom);
+                }
+                result.conflicts = self.kernel.explain_conflict(&atom_id);
+                self.sort_kernel_result(&mut result);
+                result
+            }
+            KernelQuery::ImpactIfRetracted { atom_id, max_depth } => {
+                let mut result = KernelQueryResult::default();
+                let mut impact = self.kernel.compute_impact_if_retracted(&atom_id);
+                if max_depth == 0 {
+                    impact.impacted_atoms.clear();
+                    impact.impacted_answers.clear();
+                    impact.impacted_simulations.clear();
+                    impact.invalidation_trace.invalidated_nodes.clear();
+                    impact.invalidation_trace.steps.clear();
+                }
+                result
+                    .dependency_trace
+                    .extend(impact.invalidation_trace.steps.iter().cloned());
+                result.impact = Some(impact);
+                self.sort_kernel_result(&mut result);
+                result
+            }
+            KernelQuery::EntityState {
+                entity_id,
+                valid_at,
+                known_at,
+            } => {
+                let mut result = KernelQueryResult::default();
+                let state = self
+                    .kernel
+                    .entity_state(entity_id, valid_at, known_at.into());
+                for atom in state
+                    .accepted_atoms
+                    .into_iter()
+                    .chain(state.disputed_atoms)
+                    .chain(state.superseded_atoms)
+                {
+                    self.push_kernel_result_atom(&mut result, atom);
+                }
+                result.conflicts = state.conflicts;
+                self.sort_kernel_result(&mut result);
+                result
+            }
+        }
+    }
+
     pub fn compile_native(&self, query: &NativeRealityQuery) -> NativeRealityPlan {
         let strategy = match &query.kind {
             NativeRealityQueryKind::VerifyClaim(pattern) if pattern.is_fully_bound() => {
@@ -3708,6 +4183,62 @@ impl<'a> RealityQueryVm<'a> {
         }
 
         result
+    }
+
+    fn kernel_atoms_matching(&self, pattern: &AtomPattern) -> Vec<&RealityAtom> {
+        self.kernel
+            .atoms
+            .values()
+            .filter(|atom| {
+                pattern
+                    .subject
+                    .as_ref()
+                    .map_or(true, |subject| &atom.subject == subject)
+                    && pattern
+                        .predicate
+                        .as_ref()
+                        .map_or(true, |predicate| &atom.predicate == predicate)
+                    && pattern
+                        .object
+                        .as_ref()
+                        .map_or(true, |object| &atom.object == object)
+            })
+            .collect()
+    }
+
+    fn push_kernel_result_atom(&self, result: &mut KernelQueryResult, atom: RealityAtom) {
+        let atom_id = atom.id.clone();
+        result.atom_ids.push(atom_id.clone());
+        for source_ref in &atom.source_refs {
+            result.evidence_ids.push(source_ref.source_id.clone());
+        }
+        let belief_known_at = atom.transaction_time.start;
+        if let Some(belief) = self.kernel.belief_at(&atom_id, belief_known_at) {
+            result.beliefs.push((atom_id.clone(), belief));
+        }
+        result
+            .valid_times
+            .insert(atom_id.clone(), atom.valid_time.clone());
+        result
+            .transaction_times
+            .insert(atom_id, atom.transaction_time.clone());
+        result.atoms.push(atom);
+    }
+
+    fn sort_kernel_result(&self, result: &mut KernelQueryResult) {
+        sort_and_dedup_atom_ids(&mut result.atom_ids);
+        result.evidence_ids.sort();
+        result.evidence_ids.dedup();
+        result.beliefs.sort_by(|left, right| left.0.cmp(&right.0));
+        result
+            .beliefs
+            .dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+        sort_atoms(&mut result.atoms);
+        result
+            .conflicts
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        result.conflicts.dedup_by(|left, right| left.id == right.id);
+        sort_dependency_steps(&mut result.dependency_trace);
     }
 
     fn execute_entity_state(
@@ -3889,7 +4420,7 @@ impl<'a> RealityQueryVm<'a> {
         if let Some(allowed) = allowed_permissions {
             let mut retained = Vec::new();
             for atom in atoms {
-                if allowed.contains(&atom.permissions) {
+                if self.kernel.atom_visible_with_permissions(&atom, allowed) {
                     retained.push(atom);
                 } else {
                     result.permission_filtered_atoms.push(atom.id);
@@ -4198,11 +4729,11 @@ fn model_context_time_visible(atom: &RealityAtom, request: &ModelContextRequest)
     valid_visible && known_visible
 }
 
-fn model_context_permission_visible(
-    atom: &RealityAtom,
+fn permission_scope_allows(
+    atom_permission: &PermissionLabel,
     permission_scope: &[PermissionLabel],
 ) -> bool {
-    permission_scope.is_empty() || permission_scope.contains(&atom.permissions)
+    permission_scope.is_empty() || permission_scope.contains(atom_permission)
 }
 
 fn model_context_relevance(atom: &RealityAtom, request: &ModelContextRequest) -> usize {
