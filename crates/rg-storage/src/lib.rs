@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+use redb::{Database, ReadableTable, TableDefinition};
 use rg_events::{
     AgentId, AgentMemory, AgentMemoryRecorded, Assertion, AssertionAdded, AssertionId,
     AssertionRetracted, AssertionStatus, CausalLink, CausalLinkAdded, CausalLinkId, Confidence,
@@ -18,6 +19,7 @@ use rg_events::{
 pub enum StorageError {
     AppendFailed,
     Io(String),
+    Redb(String),
     Codec(String),
     Replay(GraphReplayError),
     SnapshotMismatch,
@@ -244,6 +246,734 @@ impl From<&GraphValue> for ObjectIndexKey {
             GraphValue::Null => Self::Null,
         }
     }
+}
+
+const REDB_SCHEMA_VERSION: u32 = 1;
+const REDB_METADATA: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("hotgraph_metadata");
+const REDB_EVENTS: TableDefinition<'static, u64, &[u8]> = TableDefinition::new("events_by_lsn");
+const REDB_IDEMPOTENCY: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idempotency_by_key");
+const REDB_ENTITIES: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("entities_by_id");
+const REDB_ASSERTIONS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("assertions_by_id");
+const REDB_SOURCES: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("sources_by_id");
+const REDB_MEMORIES: TableDefinition<'static, &str, &[u8]> = TableDefinition::new("memories_by_id");
+const REDB_CAUSAL_LINKS: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("causal_links_by_id");
+const REDB_INDEX_SUBJECT: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idx_subject_to_assertions");
+const REDB_INDEX_PREDICATE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idx_predicate_to_assertions");
+const REDB_INDEX_OBJECT: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idx_object_to_assertions");
+const REDB_INDEX_SOURCE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idx_source_to_assertions");
+const REDB_INDEX_VALID_TIME: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idx_valid_time_to_assertions");
+const REDB_INDEX_TX_TIME: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idx_tx_time_to_assertions");
+const REDB_INDEX_CONTEXT: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("idx_context_to_assertions");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableAppend {
+    pub lsn: u64,
+    pub event_id: EventId,
+    pub transaction_time: TxTime,
+    pub idempotency_replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableHealth {
+    pub schema_version: u32,
+    pub last_lsn: u64,
+    pub applied_lsn: u64,
+    pub replay_lag: u64,
+    pub writer_lease: Option<WriterLease>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationRecord {
+    pub version: u32,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WriterLease {
+    pub holder_id: String,
+    pub fencing_token: u64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WriterLeaseAttempt {
+    Acquired(WriterLease),
+    Rejected(WriterLease),
+}
+
+pub trait DurableGraphStore {
+    fn append_event(
+        &mut self,
+        event: &GraphEvent,
+        idempotency_key: Option<&str>,
+    ) -> Result<DurableAppend, StorageError>;
+
+    fn events_by_lsn(
+        &self,
+        start_lsn: u64,
+        end_lsn: u64,
+    ) -> Result<Vec<(u64, GraphEvent)>, StorageError>;
+    fn materialized_storage(&self) -> Result<InMemoryStorage, StorageError>;
+    fn health(&self) -> Result<DurableHealth, StorageError>;
+}
+
+pub struct RedbGraphStore {
+    database: Database,
+}
+
+impl std::fmt::Debug for RedbGraphStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RedbGraphStore")
+    }
+}
+
+impl RedbGraphStore {
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let database = Database::create(path).map_err(redb_error)?;
+        let store = Self { database };
+        store.initialize_schema()?;
+        Ok(store)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let database = Database::open(path).map_err(redb_error)?;
+        let store = Self { database };
+        store.initialize_schema()?;
+        Ok(store)
+    }
+
+    pub fn append_event(
+        &mut self,
+        event: &GraphEvent,
+        idempotency_key: Option<&str>,
+    ) -> Result<DurableAppend, StorageError> {
+        if let Some(key) = idempotency_key {
+            if let Some(lsn) = self.idempotency_lsn(key)? {
+                let event = self.event_at_lsn(lsn)?.ok_or_else(|| {
+                    StorageError::Codec(format!(
+                        "idempotency key {key} points at missing event LSN {lsn}"
+                    ))
+                })?;
+                return Ok(DurableAppend {
+                    lsn,
+                    event_id: event.event_id().clone(),
+                    transaction_time: event.transaction_time(),
+                    idempotency_replayed: true,
+                });
+            }
+        }
+
+        let lsn = self.last_lsn()? + 1;
+        let payload = encode_event(event);
+        let checksum = checksum_hex(
+            wal_checksum_input(
+                lsn,
+                event.event_id().as_str(),
+                event.transaction_time(),
+                idempotency_key,
+                &payload,
+            )
+            .as_bytes(),
+        );
+        let record = WalRecord {
+            sequence: lsn,
+            event_id: event.event_id().as_str().to_owned(),
+            transaction_time: event.transaction_time(),
+            idempotency_key: idempotency_key.map(str::to_owned),
+            checksum,
+            event: event.clone(),
+        };
+        let encoded_record = encode_event_record(&record);
+        let lsn_string = lsn.to_string();
+
+        let write_txn = self.database.begin_write().map_err(redb_error)?;
+        {
+            let mut events = write_txn.open_table(REDB_EVENTS).map_err(redb_error)?;
+            events
+                .insert(lsn, encoded_record.as_bytes())
+                .map_err(redb_error)?;
+        }
+        if let Some(key) = idempotency_key {
+            let mut idempotency = write_txn.open_table(REDB_IDEMPOTENCY).map_err(redb_error)?;
+            idempotency
+                .insert(key, lsn_string.as_bytes())
+                .map_err(redb_error)?;
+        }
+        materialize_event_in_redb(&write_txn, event)?;
+        write_metadata_in_tx(&write_txn, "last_lsn", &lsn_string)?;
+        write_metadata_in_tx(&write_txn, "applied_lsn", &lsn_string)?;
+        write_txn.commit().map_err(redb_error)?;
+
+        Ok(DurableAppend {
+            lsn,
+            event_id: event.event_id().clone(),
+            transaction_time: event.transaction_time(),
+            idempotency_replayed: false,
+        })
+    }
+
+    pub fn events_by_lsn(
+        &self,
+        start_lsn: u64,
+        end_lsn: u64,
+    ) -> Result<Vec<(u64, GraphEvent)>, StorageError> {
+        if start_lsn > end_lsn {
+            return Ok(Vec::new());
+        }
+
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let events = read_txn.open_table(REDB_EVENTS).map_err(redb_error)?;
+        let mut output = Vec::new();
+        for record in events.range(start_lsn..=end_lsn).map_err(redb_error)? {
+            let (lsn, value) = record.map_err(redb_error)?;
+            let lsn = lsn.value();
+            let record = bytes_to_string(value.value())?;
+            let decoded = decode_event_record(&record, lsn)?;
+            output.push((lsn, decoded.event));
+        }
+        Ok(output)
+    }
+
+    pub fn materialized_storage(&self) -> Result<InMemoryStorage, StorageError> {
+        let last_lsn = self.last_lsn()?;
+        let events = self
+            .events_by_lsn(1, last_lsn)?
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
+        InMemoryStorage::replay(&events)
+    }
+
+    pub fn entity(&self, id: &EntityId) -> Result<Option<Entity>, StorageError> {
+        self.read_string_table(REDB_ENTITIES, id.as_str(), decode_entity)
+    }
+
+    pub fn assertion(&self, id: &AssertionId) -> Result<Option<Assertion>, StorageError> {
+        self.read_string_table(REDB_ASSERTIONS, id.as_str(), decode_assertion)
+    }
+
+    pub fn source(&self, id: &SourceId) -> Result<Option<Source>, StorageError> {
+        self.read_string_table(REDB_SOURCES, id.as_str(), decode_source)
+    }
+
+    pub fn idempotency_lsn(&self, key: &str) -> Result<Option<u64>, StorageError> {
+        self.read_string_table(REDB_IDEMPOTENCY, key, parse_u64)
+    }
+
+    pub fn schema_version(&self) -> Result<u32, StorageError> {
+        self.read_metadata_u32("schema_version")
+    }
+
+    pub fn record_schema_migration(
+        &mut self,
+        version: u32,
+        name: &str,
+    ) -> Result<(), StorageError> {
+        let mut history = self.migration_history()?;
+        history.push(MigrationRecord {
+            version,
+            name: name.to_owned(),
+        });
+        let history_record = encode_migration_history(&history);
+        let version_record = version.to_string();
+        let write_txn = self.database.begin_write().map_err(redb_error)?;
+        write_metadata_in_tx(&write_txn, "schema_version", &version_record)?;
+        write_metadata_in_tx(&write_txn, "migration_history", &history_record)?;
+        write_txn.commit().map_err(redb_error)?;
+        Ok(())
+    }
+
+    pub fn migration_history(&self) -> Result<Vec<MigrationRecord>, StorageError> {
+        self.read_metadata_string("migration_history")?.map_or_else(
+            || Ok(Vec::new()),
+            |record| decode_migration_history(&record),
+        )
+    }
+
+    pub fn acquire_writer_lease(
+        &mut self,
+        holder_id: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<WriterLease, StorageError> {
+        match self.try_acquire_writer_lease(holder_id, now_ms, ttl_ms)? {
+            WriterLeaseAttempt::Acquired(lease) => Ok(lease),
+            WriterLeaseAttempt::Rejected(existing) => Err(StorageError::Codec(format!(
+                "writer lease held by {} until {} with fencing token {}",
+                existing.holder_id, existing.expires_at_ms, existing.fencing_token
+            ))),
+        }
+    }
+
+    pub fn try_acquire_writer_lease(
+        &mut self,
+        holder_id: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<WriterLeaseAttempt, StorageError> {
+        if let Some(existing) = self.writer_lease()? {
+            if existing.expires_at_ms > now_ms && existing.holder_id != holder_id {
+                return Ok(WriterLeaseAttempt::Rejected(existing));
+            }
+        }
+
+        let next_token = self
+            .writer_lease()?
+            .map(|lease| lease.fencing_token.saturating_add(1))
+            .unwrap_or(1);
+        let lease = WriterLease {
+            holder_id: holder_id.to_owned(),
+            fencing_token: next_token,
+            expires_at_ms: now_ms.saturating_add(ttl_ms),
+        };
+        let encoded = encode_writer_lease(&lease);
+        let write_txn = self.database.begin_write().map_err(redb_error)?;
+        write_metadata_in_tx(&write_txn, "writer_lease", &encoded)?;
+        write_txn.commit().map_err(redb_error)?;
+        Ok(WriterLeaseAttempt::Acquired(lease))
+    }
+
+    pub fn writer_lease(&self) -> Result<Option<WriterLease>, StorageError> {
+        self.read_metadata_string("writer_lease")?
+            .map_or_else(|| Ok(None), |record| decode_writer_lease(&record).map(Some))
+    }
+
+    pub fn health(&self) -> Result<DurableHealth, StorageError> {
+        let last_lsn = self.last_lsn()?;
+        let applied_lsn = self.read_metadata_u64("applied_lsn")?;
+        Ok(DurableHealth {
+            schema_version: self.schema_version()?,
+            last_lsn,
+            applied_lsn,
+            replay_lag: last_lsn.saturating_sub(applied_lsn),
+            writer_lease: self.writer_lease()?,
+        })
+    }
+
+    fn initialize_schema(&self) -> Result<(), StorageError> {
+        let write_txn = self.database.begin_write().map_err(redb_error)?;
+        {
+            let mut metadata = write_txn.open_table(REDB_METADATA).map_err(redb_error)?;
+            if metadata
+                .get("schema_version")
+                .map_err(redb_error)?
+                .is_none()
+            {
+                metadata
+                    .insert("schema_version", REDB_SCHEMA_VERSION.to_string().as_bytes())
+                    .map_err(redb_error)?;
+            }
+            if metadata.get("last_lsn").map_err(redb_error)?.is_none() {
+                metadata
+                    .insert("last_lsn", b"0".as_slice())
+                    .map_err(redb_error)?;
+            }
+            if metadata.get("applied_lsn").map_err(redb_error)?.is_none() {
+                metadata
+                    .insert("applied_lsn", b"0".as_slice())
+                    .map_err(redb_error)?;
+            }
+        }
+        {
+            write_txn.open_table(REDB_EVENTS).map_err(redb_error)?;
+            write_txn.open_table(REDB_IDEMPOTENCY).map_err(redb_error)?;
+            write_txn.open_table(REDB_ENTITIES).map_err(redb_error)?;
+            write_txn.open_table(REDB_ASSERTIONS).map_err(redb_error)?;
+            write_txn.open_table(REDB_SOURCES).map_err(redb_error)?;
+            write_txn.open_table(REDB_MEMORIES).map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_CAUSAL_LINKS)
+                .map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_INDEX_SUBJECT)
+                .map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_INDEX_PREDICATE)
+                .map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_INDEX_OBJECT)
+                .map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_INDEX_SOURCE)
+                .map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_INDEX_VALID_TIME)
+                .map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_INDEX_TX_TIME)
+                .map_err(redb_error)?;
+            write_txn
+                .open_table(REDB_INDEX_CONTEXT)
+                .map_err(redb_error)?;
+        }
+        write_txn.commit().map_err(redb_error)
+    }
+
+    fn last_lsn(&self) -> Result<u64, StorageError> {
+        self.read_metadata_u64("last_lsn")
+    }
+
+    fn event_at_lsn(&self, lsn: u64) -> Result<Option<GraphEvent>, StorageError> {
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let events = read_txn.open_table(REDB_EVENTS).map_err(redb_error)?;
+        let Some(value) = events.get(lsn).map_err(redb_error)? else {
+            return Ok(None);
+        };
+        let record = bytes_to_string(value.value())?;
+        let decoded = decode_event_record(&record, lsn)?;
+        Ok(Some(decoded.event))
+    }
+
+    fn read_metadata_string(&self, key: &str) -> Result<Option<String>, StorageError> {
+        self.read_string_table(REDB_METADATA, key, |record| Ok(record.to_owned()))
+    }
+
+    fn read_metadata_u64(&self, key: &str) -> Result<u64, StorageError> {
+        self.read_metadata_string(key)?
+            .ok_or_else(|| StorageError::Codec(format!("missing metadata key {key}")))?
+            .parse::<u64>()
+            .map_err(|error| StorageError::Codec(error.to_string()))
+    }
+
+    fn read_metadata_u32(&self, key: &str) -> Result<u32, StorageError> {
+        self.read_metadata_string(key)?
+            .ok_or_else(|| StorageError::Codec(format!("missing metadata key {key}")))?
+            .parse::<u32>()
+            .map_err(|error| StorageError::Codec(error.to_string()))
+    }
+
+    fn read_string_table<T>(
+        &self,
+        table: TableDefinition<'static, &str, &[u8]>,
+        key: &str,
+        decode: impl FnOnce(&str) -> Result<T, StorageError>,
+    ) -> Result<Option<T>, StorageError> {
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let table = read_txn.open_table(table).map_err(redb_error)?;
+        let Some(value) = table.get(key).map_err(redb_error)? else {
+            return Ok(None);
+        };
+        let record = bytes_to_string(value.value())?;
+        decode(&record).map(Some)
+    }
+}
+
+impl DurableGraphStore for RedbGraphStore {
+    fn append_event(
+        &mut self,
+        event: &GraphEvent,
+        idempotency_key: Option<&str>,
+    ) -> Result<DurableAppend, StorageError> {
+        Self::append_event(self, event, idempotency_key)
+    }
+
+    fn events_by_lsn(
+        &self,
+        start_lsn: u64,
+        end_lsn: u64,
+    ) -> Result<Vec<(u64, GraphEvent)>, StorageError> {
+        Self::events_by_lsn(self, start_lsn, end_lsn)
+    }
+
+    fn materialized_storage(&self) -> Result<InMemoryStorage, StorageError> {
+        Self::materialized_storage(self)
+    }
+
+    fn health(&self) -> Result<DurableHealth, StorageError> {
+        Self::health(self)
+    }
+}
+
+fn materialize_event_in_redb(
+    write_txn: &redb::WriteTransaction,
+    event: &GraphEvent,
+) -> Result<(), StorageError> {
+    match event {
+        GraphEvent::EntityCreated(event) => {
+            let mut entities = write_txn.open_table(REDB_ENTITIES).map_err(redb_error)?;
+            let encoded = encode_entity(&event.entity);
+            entities
+                .insert(event.entity.id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+        }
+        GraphEvent::AssertionAdded(event) => {
+            let mut assertions = write_txn.open_table(REDB_ASSERTIONS).map_err(redb_error)?;
+            let encoded = encode_assertion(&event.assertion);
+            assertions
+                .insert(event.assertion.id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+            index_assertion_in_redb(write_txn, &event.assertion)?;
+        }
+        GraphEvent::AssertionRetracted(event) => {
+            let mut assertions = write_txn.open_table(REDB_ASSERTIONS).map_err(redb_error)?;
+            let existing = read_write_table_string(&assertions, event.assertion_id.as_str())?;
+            let mut assertion = existing
+                .as_deref()
+                .map(decode_assertion)
+                .transpose()?
+                .ok_or_else(|| {
+                    StorageError::Codec(format!(
+                        "cannot retract unknown assertion {}",
+                        event.assertion_id.as_str()
+                    ))
+                })?;
+            assertion.status = AssertionStatus::Retracted;
+            assertion.transaction_time.end = Some(event.transaction_time);
+            let encoded = encode_assertion(&assertion);
+            assertions
+                .insert(event.assertion_id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+        }
+        GraphEvent::SourceAdded(event) => {
+            let mut sources = write_txn.open_table(REDB_SOURCES).map_err(redb_error)?;
+            let encoded = encode_source(&event.source);
+            sources
+                .insert(event.source.id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+        }
+        GraphEvent::EvidenceLinked(event) => {
+            let mut assertions = write_txn.open_table(REDB_ASSERTIONS).map_err(redb_error)?;
+            let existing = read_write_table_string(&assertions, event.assertion_id.as_str())?;
+            let mut assertion = existing
+                .as_deref()
+                .map(decode_assertion)
+                .transpose()?
+                .ok_or_else(|| {
+                    StorageError::Codec(format!(
+                        "cannot link evidence to unknown assertion {}",
+                        event.assertion_id.as_str()
+                    ))
+                })?;
+            if !assertion.source_ids.contains(&event.source_id) {
+                assertion.source_ids.push(event.source_id.clone());
+                assertion.source_ids.sort();
+                assertion.source_ids.dedup();
+            }
+            let encoded = encode_assertion(&assertion);
+            assertions
+                .insert(event.assertion_id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+            append_durable_index_entry(
+                write_txn,
+                REDB_INDEX_SOURCE,
+                event.source_id.as_str(),
+                event.assertion_id.as_str(),
+            )?;
+        }
+        GraphEvent::EntityMerged(_) => {}
+        GraphEvent::ConfidenceUpdated(event) => {
+            let mut assertions = write_txn.open_table(REDB_ASSERTIONS).map_err(redb_error)?;
+            let existing = read_write_table_string(&assertions, event.assertion_id.as_str())?;
+            let mut assertion = existing
+                .as_deref()
+                .map(decode_assertion)
+                .transpose()?
+                .ok_or_else(|| {
+                    StorageError::Codec(format!(
+                        "cannot update confidence for unknown assertion {}",
+                        event.assertion_id.as_str()
+                    ))
+                })?;
+            assertion.confidence = event.confidence;
+            for source_id in &event.source_ids {
+                if !assertion.source_ids.contains(source_id) {
+                    assertion.source_ids.push(source_id.clone());
+                }
+                append_durable_index_entry(
+                    write_txn,
+                    REDB_INDEX_SOURCE,
+                    source_id.as_str(),
+                    event.assertion_id.as_str(),
+                )?;
+            }
+            assertion.source_ids.sort();
+            assertion.source_ids.dedup();
+            let encoded = encode_assertion(&assertion);
+            assertions
+                .insert(event.assertion_id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+        }
+        GraphEvent::CausalLinkAdded(event) => {
+            let mut causal_links = write_txn
+                .open_table(REDB_CAUSAL_LINKS)
+                .map_err(redb_error)?;
+            let encoded = encode_causal_link(&event.causal_link);
+            causal_links
+                .insert(event.causal_link.id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+        }
+        GraphEvent::AgentMemoryRecorded(event) => {
+            let mut memories = write_txn.open_table(REDB_MEMORIES).map_err(redb_error)?;
+            for superseded_id in &event.memory.supersedes {
+                let existing = read_write_table_string(&memories, superseded_id.as_str())?;
+                if let Some(existing) = existing {
+                    let mut memory = decode_agent_memory(&existing)?;
+                    memory.status = MemoryStatus::Superseded;
+                    let encoded = encode_agent_memory(&memory);
+                    memories
+                        .insert(superseded_id.as_str(), encoded.as_bytes())
+                        .map_err(redb_error)?;
+                }
+            }
+            let encoded = encode_agent_memory(&event.memory);
+            memories
+                .insert(event.memory.id.as_str(), encoded.as_bytes())
+                .map_err(redb_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn index_assertion_in_redb(
+    write_txn: &redb::WriteTransaction,
+    assertion: &Assertion,
+) -> Result<(), StorageError> {
+    append_durable_index_entry(
+        write_txn,
+        REDB_INDEX_SUBJECT,
+        assertion.subject.as_str(),
+        assertion.id.as_str(),
+    )?;
+    append_durable_index_entry(
+        write_txn,
+        REDB_INDEX_PREDICATE,
+        assertion.predicate.as_str(),
+        assertion.id.as_str(),
+    )?;
+    append_durable_index_entry(
+        write_txn,
+        REDB_INDEX_OBJECT,
+        &encode_graph_value(&assertion.object),
+        assertion.id.as_str(),
+    )?;
+    append_durable_index_entry(
+        write_txn,
+        REDB_INDEX_VALID_TIME,
+        &assertion.valid_time.start.as_i64().to_string(),
+        assertion.id.as_str(),
+    )?;
+    append_durable_index_entry(
+        write_txn,
+        REDB_INDEX_TX_TIME,
+        &assertion.transaction_time.start.as_i64().to_string(),
+        assertion.id.as_str(),
+    )?;
+    append_durable_index_entry(
+        write_txn,
+        REDB_INDEX_CONTEXT,
+        &encode_context_scope(&assertion.context),
+        assertion.id.as_str(),
+    )?;
+    for source_id in &assertion.source_ids {
+        append_durable_index_entry(
+            write_txn,
+            REDB_INDEX_SOURCE,
+            source_id.as_str(),
+            assertion.id.as_str(),
+        )?;
+    }
+    Ok(())
+}
+
+fn append_durable_index_entry(
+    write_txn: &redb::WriteTransaction,
+    table: TableDefinition<'static, &str, &[u8]>,
+    key: &str,
+    value: &str,
+) -> Result<(), StorageError> {
+    let mut table = write_txn.open_table(table).map_err(redb_error)?;
+    let mut values = read_write_table_string(&table, key)?
+        .map(|record| decode_parts(&record))
+        .transpose()?
+        .unwrap_or_default();
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_owned());
+        values.sort();
+    }
+    let encoded = encode_parts(&values);
+    table.insert(key, encoded.as_bytes()).map_err(redb_error)?;
+    Ok(())
+}
+
+fn read_write_table_string(
+    table: &redb::Table<'_, &str, &[u8]>,
+    key: &str,
+) -> Result<Option<String>, StorageError> {
+    table
+        .get(key)
+        .map_err(redb_error)?
+        .map(|value| bytes_to_string(value.value()))
+        .transpose()
+}
+
+fn write_metadata_in_tx(
+    write_txn: &redb::WriteTransaction,
+    key: &str,
+    value: &str,
+) -> Result<(), StorageError> {
+    let mut metadata = write_txn.open_table(REDB_METADATA).map_err(redb_error)?;
+    metadata.insert(key, value.as_bytes()).map_err(redb_error)?;
+    Ok(())
+}
+
+fn encode_migration_history(records: &[MigrationRecord]) -> String {
+    records
+        .iter()
+        .map(|record| encode_parts(&[record.version.to_string(), record.name.clone()]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_migration_history(record: &str) -> Result<Vec<MigrationRecord>, StorageError> {
+    if record.is_empty() {
+        return Ok(Vec::new());
+    }
+    record
+        .lines()
+        .map(|line| {
+            let parts = decode_parts(line)?;
+            Ok(MigrationRecord {
+                version: parse_u32(required(&parts, 0, "migration version")?)?,
+                name: required(&parts, 1, "migration name")?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn encode_writer_lease(lease: &WriterLease) -> String {
+    encode_parts(&[
+        lease.holder_id.clone(),
+        lease.fencing_token.to_string(),
+        lease.expires_at_ms.to_string(),
+    ])
+}
+
+fn decode_writer_lease(record: &str) -> Result<WriterLease, StorageError> {
+    let parts = decode_parts(record)?;
+    Ok(WriterLease {
+        holder_id: required(&parts, 0, "writer lease holder")?.to_owned(),
+        fencing_token: parse_u64(required(&parts, 1, "writer lease fencing token")?)?,
+        expires_at_ms: parse_i64(required(&parts, 2, "writer lease expiry")?)?,
+    })
+}
+
+fn bytes_to_string(bytes: &[u8]) -> Result<String, StorageError> {
+    String::from_utf8(bytes.to_vec()).map_err(|error| StorageError::Codec(error.to_string()))
+}
+
+fn redb_error(error: impl std::fmt::Display) -> StorageError {
+    StorageError::Redb(error.to_string())
 }
 
 fn push_index<K>(index: &mut BTreeMap<K, Vec<AssertionId>>, key: K, assertion_id: AssertionId)
@@ -2664,6 +3394,164 @@ mod tests {
             deterministic_state_hash(&first),
             deterministic_state_hash(&second)
         );
+    }
+
+    #[test]
+    fn redb_graph_store_appends_events_and_reopens_materialized_state() {
+        let path = temp_file("redb-store");
+        let events = sample_events();
+        let expected = InMemoryStorage::replay(&events).expect("expected replay");
+
+        {
+            let mut store = RedbGraphStore::create(&path).expect("create redb store");
+            for event in &events {
+                store
+                    .append_event(event, None)
+                    .expect("append durable event");
+            }
+
+            assert_eq!(
+                store.health().expect("health").last_lsn,
+                events.len() as u64
+            );
+            assert!(store
+                .entity(&EntityId::new("person-a"))
+                .expect("read entity")
+                .is_some());
+            assert!(store
+                .assertion(&AssertionId::new("assertion-1"))
+                .expect("read assertion")
+                .is_some());
+            assert!(store
+                .source(&SourceId::new("source-1"))
+                .expect("read source")
+                .is_some());
+        }
+
+        let reopened = RedbGraphStore::open(&path).expect("reopen redb store");
+        let restored = reopened
+            .materialized_storage()
+            .expect("restore materialized storage");
+
+        assert_eq!(restored.events(), expected.events());
+        assert_eq!(restored.graph_state(), expected.graph_state());
+        assert_eq!(
+            deterministic_state_hash(&restored),
+            deterministic_state_hash(&expected)
+        );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn redb_graph_store_persists_idempotency_records() {
+        let path = temp_file("redb-idempotency");
+        let events = sample_events();
+
+        {
+            let mut store = RedbGraphStore::create(&path).expect("create redb store");
+            let first = store
+                .append_event(&events[0], Some("source-1-once"))
+                .expect("first append");
+            let replayed = store
+                .append_event(&events[0], Some("source-1-once"))
+                .expect("idempotent append");
+
+            assert_eq!(first.lsn, 1);
+            assert_eq!(replayed.lsn, 1);
+            assert!(replayed.idempotency_replayed);
+            assert_eq!(store.health().expect("health").last_lsn, 1);
+        }
+
+        let reopened = RedbGraphStore::open(&path).expect("reopen redb store");
+        assert_eq!(
+            reopened
+                .idempotency_lsn("source-1-once")
+                .expect("read idempotency lsn"),
+            Some(1)
+        );
+        assert_eq!(reopened.events_by_lsn(1, 10).expect("read events").len(), 1);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn redb_graph_store_reads_events_by_lsn_range() {
+        let path = temp_file("redb-lsn-range");
+        let events = sample_events();
+
+        {
+            let mut store = RedbGraphStore::create(&path).expect("create redb store");
+            for event in &events {
+                store.append_event(event, None).expect("append event");
+            }
+        }
+
+        let reopened = RedbGraphStore::open(&path).expect("reopen redb store");
+        let range = reopened.events_by_lsn(2, 3).expect("read lsn range");
+
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].0, 2);
+        assert_eq!(range[0].1, events[1]);
+        assert_eq!(range[1].0, 3);
+        assert_eq!(range[1].1, events[2]);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn redb_graph_store_tracks_schema_migration_version() {
+        let path = temp_file("redb-schema");
+
+        {
+            let mut store = RedbGraphStore::create(&path).expect("create redb store");
+            assert_eq!(store.schema_version().expect("schema version"), 1);
+            store
+                .record_schema_migration(2, "tenant-partition-index")
+                .expect("record migration");
+        }
+
+        let reopened = RedbGraphStore::open(&path).expect("reopen redb store");
+        assert_eq!(reopened.schema_version().expect("schema version"), 2);
+        assert_eq!(
+            reopened
+                .migration_history()
+                .expect("migration history")
+                .last()
+                .map(|entry| entry.name.as_str()),
+            Some("tenant-partition-index")
+        );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn redb_graph_store_enforces_writer_lease_fencing() {
+        let path = temp_file("redb-lease");
+        let mut store = RedbGraphStore::create(&path).expect("create redb store");
+
+        let first = store
+            .acquire_writer_lease("writer-a", 1_000, 5_000)
+            .expect("acquire first lease");
+        assert_eq!(first.holder_id, "writer-a");
+        assert_eq!(first.fencing_token, 1);
+
+        let rejected = store
+            .try_acquire_writer_lease("writer-b", 2_000, 5_000)
+            .expect("try acquire competing lease");
+        assert!(matches!(
+            rejected,
+            WriterLeaseAttempt::Rejected(existing)
+                if existing.holder_id == "writer-a" && existing.fencing_token == 1
+        ));
+
+        let second = store
+            .acquire_writer_lease("writer-b", 7_000, 5_000)
+            .expect("acquire expired lease");
+        assert_eq!(second.holder_id, "writer-b");
+        assert_eq!(second.fencing_token, 2);
+
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]

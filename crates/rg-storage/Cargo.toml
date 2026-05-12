@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+redb = "2"
 rg-events = { path = "../rg-events" }
 
 [lints]

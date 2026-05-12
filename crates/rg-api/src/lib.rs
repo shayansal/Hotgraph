@@ -29,7 +29,7 @@ use rg_ingest::{
 use rg_query::{
     EntityPattern, GraphQuery, ObjectPattern, PathQuery, PredicatePattern, QueryEngine, QueryResult,
 };
-use rg_storage::{FileEventLog, InMemoryStorage, StorageError, WalAppendMetadata};
+use rg_storage::{FileEventLog, InMemoryStorage, RedbGraphStore, StorageError, WalAppendMetadata};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
@@ -47,6 +47,7 @@ pub struct ApiState {
     log: Arc<Mutex<EventLog>>,
     storage: Arc<Mutex<InMemoryStorage>>,
     durable_log: Option<Arc<Mutex<FileEventLog>>>,
+    durable_store: Option<Arc<Mutex<RedbGraphStore>>>,
     auth: Arc<AuthConfig>,
     idempotency: Arc<Mutex<BTreeMap<String, IdempotencyRecord>>>,
     idempotency_path: Option<Arc<PathBuf>>,
@@ -65,6 +66,7 @@ impl ApiState {
             log: Arc::new(Mutex::new(EventLog::new(TxTime::new(0)))),
             storage: Arc::new(Mutex::new(InMemoryStorage::new())),
             durable_log: None,
+            durable_store: None,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
@@ -84,6 +86,7 @@ impl ApiState {
             log: Arc::new(Mutex::new(log)),
             storage: Arc::new(Mutex::new(storage)),
             durable_log: None,
+            durable_store: None,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
@@ -106,6 +109,7 @@ impl ApiState {
             log: Arc::new(Mutex::new(log)),
             storage: Arc::new(Mutex::new(storage)),
             durable_log: Some(Arc::new(Mutex::new(file_log))),
+            durable_store: None,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
@@ -123,15 +127,47 @@ impl ApiState {
         Self::from_file_event_log(path)
     }
 
+    pub fn from_redb_graph_store(path: impl AsRef<FsPath>) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        let store = if path.exists() {
+            RedbGraphStore::open(path)?
+        } else {
+            RedbGraphStore::create(path)?
+        };
+        let storage = store.materialized_storage()?;
+        let log = EventLog::from_events(storage.events().to_vec()).map_err(StorageError::Replay)?;
+        Ok(Self {
+            log: Arc::new(Mutex::new(log)),
+            storage: Arc::new(Mutex::new(storage)),
+            durable_log: None,
+            durable_store: Some(Arc::new(Mutex::new(store))),
+            auth: Arc::new(AuthConfig::disabled()),
+            idempotency: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency_path: None,
+            slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            default_query_limit: DEFAULT_QUERY_LIMIT,
+            max_query_limit: DEFAULT_MAX_QUERY_LIMIT,
+            max_path_depth: DEFAULT_MAX_PATH_DEPTH,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            metrics: Arc::new(Mutex::new(ApiMetrics::default())),
+        })
+    }
+
     pub fn from_env() -> Result<Self, ApiConfigError> {
-        let mut state = if let Some(path) = std::env::var_os("RG_EVENT_LOG_PATH") {
+        let mut state = if let Some(path) = std::env::var_os("RG_REDB_PATH") {
+            Self::from_redb_graph_store(PathBuf::from(path)).map_err(ApiConfigError::from)?
+        } else if let Some(path) = std::env::var_os("RG_EVENT_LOG_PATH") {
             Self::from_durable_event_log(PathBuf::from(path)).map_err(ApiConfigError::from)?
         } else {
             Self::new_in_memory()
         };
-        if state.durable_log.is_none() && configured_replica_count()? > 1 {
+        if state.durable_log.is_none()
+            && state.durable_store.is_none()
+            && configured_replica_count()? > 1
+        {
             return Err(ApiConfigError::new(
-                "multiple API replicas require RG_EVENT_LOG_PATH durable storage",
+                "multiple API replicas require RG_REDB_PATH or RG_EVENT_LOG_PATH durable storage",
             ));
         }
         if let Some(path) = std::env::var_os("RG_IDEMPOTENCY_LOG_PATH") {
@@ -229,6 +265,21 @@ impl ApiState {
                     "idempotency key reused for different command",
                 ));
             }
+            if let Some(durable_store) = &self.durable_store {
+                let store = durable_store
+                    .lock()
+                    .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?;
+                if let Some(lsn) = store.idempotency_lsn(key).map_err(ApiError::from)? {
+                    let existing = store
+                        .events_by_lsn(lsn, lsn)
+                        .map_err(ApiError::from)?
+                        .into_iter()
+                        .next()
+                        .map(|(_, event)| event)
+                        .ok_or_else(|| ApiError::internal("idempotent event LSN was not found"))?;
+                    return Ok(existing);
+                }
+            }
         }
 
         let mut log = self
@@ -237,7 +288,25 @@ impl ApiState {
             .map_err(|_| ApiError::internal("event log lock poisoned"))?;
         let mut candidate = log.clone();
         let event = candidate.execute(command).map_err(ApiError::from)?;
-        if let Some(durable_log) = &self.durable_log {
+        if let Some(durable_store) = &self.durable_store {
+            let append = durable_store
+                .lock()
+                .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+                .append_event(&event, idempotency_key.as_deref())
+                .map_err(ApiError::from)?;
+            if append.idempotency_replayed {
+                let existing = durable_store
+                    .lock()
+                    .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+                    .events_by_lsn(append.lsn, append.lsn)
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .next()
+                    .map(|(_, event)| event)
+                    .ok_or_else(|| ApiError::internal("idempotent event LSN was not found"))?;
+                return Ok(existing);
+            }
+        } else if let Some(durable_log) = &self.durable_log {
             let metadata = idempotency_key
                 .as_deref()
                 .map(|key| WalAppendMetadata::new().with_idempotency_key(key))
@@ -305,6 +374,13 @@ impl ApiState {
     }
 
     fn storage_snapshot(&self) -> Result<InMemoryStorage, ApiError> {
+        if let Some(durable_store) = &self.durable_store {
+            return durable_store
+                .lock()
+                .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+                .materialized_storage()
+                .map_err(ApiError::from);
+        }
         self.storage
             .lock()
             .map_err(|_| ApiError::internal("storage lock poisoned"))
@@ -324,6 +400,13 @@ impl ApiState {
 
     fn health_snapshot(&self) -> Result<HealthResponse, ApiError> {
         let metrics = self.metrics_snapshot()?;
+        if let Some(durable_store) = &self.durable_store {
+            durable_store
+                .lock()
+                .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+                .health()
+                .map_err(ApiError::from)?;
+        }
         Ok(HealthResponse {
             status: "ok".to_owned(),
             event_log: "ok".to_owned(),
@@ -2553,5 +2636,65 @@ fn slugify(value: &str) -> String {
         "unknown".to_owned()
     } else {
         slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_redb_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        path.push(format!(
+            "hotgraph-api-{name}-{}-{nanos}.redb",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn api_redb_state_reloads_events_and_idempotency_after_restart() {
+        let path = temp_redb_path("idempotent-restart");
+        let command = GraphCommand::AddSource(AddSource {
+            id: SourceId::new("source-redb-1"),
+            source_type: SourceType::Document,
+            uri: Some("file://redb-source.md".to_owned()),
+            content_hash: rg_core::ContentHash::new("sha256:redb-source"),
+            trust_score: Some(0.8),
+        });
+
+        {
+            let state = ApiState::from_redb_graph_store(&path).expect("create redb api state");
+            let first = state
+                .execute(command.clone(), Some("source-redb-1-once".to_owned()))
+                .expect("first write");
+            let second = state
+                .execute(command.clone(), Some("source-redb-1-once".to_owned()))
+                .expect("idempotent replay before restart");
+
+            assert_eq!(first, second);
+            assert_eq!(state.metrics_snapshot().expect("metrics").events, 1);
+        }
+
+        let restarted = ApiState::from_redb_graph_store(&path).expect("reload redb api state");
+        assert_eq!(restarted.metrics_snapshot().expect("metrics").events, 1);
+        let after_restart = restarted
+            .execute(command, Some("source-redb-1-once".to_owned()))
+            .expect("idempotent replay after restart");
+
+        assert_eq!(
+            after_restart.event_id().as_str(),
+            "evt-000000000000000001-source-added"
+        );
+        assert_eq!(restarted.metrics_snapshot().expect("metrics").events, 1);
+
+        fs::remove_file(path).expect("cleanup");
     }
 }
