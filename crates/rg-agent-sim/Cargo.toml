@@ -1,0 +1,22 @@
+[package]
+name = "rg-agent-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-agent-memory = { path = "../rg-agent-memory" }
+rg-ai = { path = "../rg-ai" }
+rg-causal = { path = "../rg-causal" }
+rg-core = { path = "../rg-core" }
+rg-events = { path = "../rg-events" }
+rg-governance = { path = "../rg-governance" }
+rg-retrieval-compiler = { path = "../rg-retrieval-compiler" }
+
+[dev-dependencies]
+rg-storage = { path = "../rg-storage" }
+
+[lints]
+workspace = true
+

@@ -1,0 +1,42 @@
+{
+  "uid": "reality-graph-overview",
+  "title": "Reality Graph Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Events",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rg_graph_events_total"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Assertions",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rg_graph_assertions_total"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Index Health",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rg_graph_index_health"
+        }
+      ]
+    }
+  ]
+}

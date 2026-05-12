@@ -1,0 +1,12 @@
+[package]
+name = "rg-frontier-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-eval = { path = "../rg-eval" }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "rg-retrieval-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-ai = { path = "../rg-ai" }
+rg-core = { path = "../rg-core" }
+rg-query = { path = "../rg-query" }
+rg-storage = { path = "../rg-storage" }
+
+[dev-dependencies]
+rg-events = { path = "../rg-events" }
+
+[lints]
+workspace = true

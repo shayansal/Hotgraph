@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package reality_graph.context_serving.v1;
+
+message EvidencePackStreamRequest {
+  string query = 1;
+  int64 valid_at = 2;
+  int64 known_at = 3;
+  uint64 max_context_tokens = 4;
+}
+
+message EvidencePackFrame {
+  string frame_id = 1;
+  string kind = 2;
+  uint64 estimated_tokens = 3;
+  repeated string assertion_ids = 4;
+  repeated string source_ids = 5;
+  bytes payload = 6;
+}
+
+message ZeroCopySourceSlice {
+  string source_id = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+  string content_hash = 4;
+}
+
+message EvidencePackStreamSummary {
+  uint64 frame_count = 1;
+  uint64 total_estimated_tokens = 2;
+  bool truncated = 3;
+  repeated string opentelemetry_span_names = 4;
+}
+
+service ContextServingService {
+  rpc StreamEvidencePack(EvidencePackStreamRequest) returns (stream EvidencePackFrame);
+  rpc BatchStreamEvidencePacks(stream EvidencePackStreamRequest) returns (stream EvidencePackFrame);
+}

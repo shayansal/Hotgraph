@@ -1,0 +1,15 @@
+[package]
+name = "rg-feedback-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-core = { path = "../rg-core" }
+rg-learning = { path = "../rg-learning" }
+rg-agent-judge = { path = "../rg-agent-judge" }
+rg-training-data = { path = "../rg-training-data" }
+
+[lints]
+workspace = true

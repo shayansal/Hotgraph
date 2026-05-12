@@ -1,0 +1,7 @@
+target/
+.git/
+.pytest_cache/
+frontend/console/node_modules/
+frontend/console/.next/
+infra/docker/grafana/data/
+*.log

@@ -1,0 +1,4 @@
+dataset:agent_conversation_memory
+case:agent-memory-preference|What deployment style does Agent Alpha prefer?|Blue-green deployments|20260401|20260511|agent_memory|mem-alpha-bluegreen||
+evidence:mem-alpha-bluegreen|agent-alpha|PREFERS|blue-green-deployments|20260301||20260401|Agent Alpha prefers blue-green deployments for production rollouts.
+evidence:mem-alpha-old|agent-alpha|PREFERS|manual-rollouts|20250101|20260301|20250101|Agent Alpha previously preferred manual rollouts before the correction.

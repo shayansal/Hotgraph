@@ -1,0 +1,5 @@
+dataset:geopolitical_events
+case:geo-sanction-oil-chain|Which event is linked to the oil price increase?|Sanction announcement|20260104|20260511|causal_chain|geo-sanction,geo-oil-rise|path-sanction-oil|
+evidence:geo-sanction|sanction-announced|CAUSES|supply-restriction-expectation|20260101||20260511|A sanction announcement created expectations of supply restrictions.
+evidence:geo-oil-rise|supply-restriction-expectation|CAUSES|oil-price-increase|20260104||20260511|Supply restriction expectations preceded an oil price increase three days later.
+path:path-sanction-oil|geo-sanction,geo-oil-rise

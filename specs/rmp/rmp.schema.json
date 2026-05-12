@@ -1,0 +1,477 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reality-graph.dev/specs/rmp/rmp.schema.json",
+  "title": "Reality Memory Protocol",
+  "type": "object",
+  "required": ["protocol", "operation", "request_id", "actor", "request"],
+  "additionalProperties": false,
+  "properties": {
+    "protocol": {
+      "const": "rmp"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^1\\.0\\.\\d+$",
+      "default": "1.0.0"
+    },
+    "operation": {
+      "$ref": "#/$defs/Operation"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "actor": {
+      "$ref": "#/$defs/Actor"
+    },
+    "temporal_context": {
+      "$ref": "#/$defs/TemporalContext"
+    },
+    "permission_context": {
+      "$ref": "#/$defs/Permission"
+    },
+    "request": {
+      "$ref": "#/$defs/RmpRequest"
+    },
+    "response": {
+      "$ref": "#/$defs/RmpResponse"
+    }
+  },
+  "$defs": {
+    "Operation": {
+      "type": "string",
+      "enum": [
+        "REMEMBER",
+        "RECALL",
+        "VERIFY",
+        "REVISE",
+        "FORGET",
+        "EXPLAIN",
+        "SIMULATE",
+        "GROUND",
+        "COMPRESS",
+        "SHARE",
+        "AUDIT"
+      ]
+    },
+    "Actor": {
+      "type": "object",
+      "required": ["principal_id", "tenant_id"],
+      "additionalProperties": false,
+      "properties": {
+        "principal_id": { "type": "string" },
+        "agent_id": { "type": "string" },
+        "tenant_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "client_name": { "type": "string" }
+      }
+    },
+    "TemporalContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "valid_at": { "type": "string", "format": "date-time" },
+        "known_at": { "type": "string", "format": "date-time" },
+        "valid_during": { "$ref": "#/$defs/TimeInterval" },
+        "tx_during": { "$ref": "#/$defs/TimeInterval" }
+      }
+    },
+    "TimeInterval": {
+      "type": "object",
+      "required": ["from"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "type": "string", "format": "date-time" },
+        "to": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "Permission": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": ["private", "agent", "team", "organization", "tenant", "public", "federated"]
+        },
+        "capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Operation" },
+          "uniqueItems": true
+        },
+        "source_policy": { "type": "string" },
+        "memory_policy": { "type": "string" },
+        "redaction_policy": { "type": "string" },
+        "share_policy": { "type": "string" },
+        "requires_human_review": { "type": "boolean", "default": false }
+      }
+    },
+    "RmpRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "query": { "type": "string" },
+        "question": { "type": "string" },
+        "task": { "type": "string" },
+        "claim": { "$ref": "#/$defs/Claim" },
+        "memory": { "$ref": "#/$defs/Memory" },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Evidence" }
+        },
+        "target_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "context_pack": { "$ref": "#/$defs/ContextPack" },
+        "simulation": { "$ref": "#/$defs/SimulationTrace" },
+        "compression": { "$ref": "#/$defs/CompressionRequest" },
+        "share": { "$ref": "#/$defs/ShareRequest" },
+        "audit": { "$ref": "#/$defs/AuditRequest" },
+        "options": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "RmpResponse": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["ok", "accepted", "needs_review", "denied", "error"]
+        },
+        "memories": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Memory" }
+        },
+        "claims": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Claim" }
+        },
+        "beliefs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Belief" }
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Evidence" }
+        },
+        "timeline": { "$ref": "#/$defs/Timeline" },
+        "context_pack": { "$ref": "#/$defs/ContextPack" },
+        "contradictions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Contradiction" }
+        },
+        "causal_trace": { "$ref": "#/$defs/CausalTrace" },
+        "simulation_trace": { "$ref": "#/$defs/SimulationTrace" },
+        "permissions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Permission" }
+        },
+        "audit_events": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AuditEvent" }
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "error": { "$ref": "#/$defs/RmpError" }
+      }
+    },
+    "Memory": {
+      "type": "object",
+      "required": ["id", "memory_type", "content", "confidence", "source_ids", "lifecycle"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "agent_id": { "type": "string" },
+        "memory_type": {
+          "type": "string",
+          "enum": ["episodic", "semantic", "procedural", "preference", "goal", "plan", "reflection", "correction", "relationship", "world_state"]
+        },
+        "content": { "type": "string" },
+        "valid_time": { "$ref": "#/$defs/TimeInterval" },
+        "confidence": { "$ref": "#/$defs/Confidence" },
+        "source_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "related_entity_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "supersedes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "lifecycle": {
+          "type": "string",
+          "enum": ["candidate", "active", "reinforced", "superseded", "contradicted", "archived"]
+        },
+        "permission": { "$ref": "#/$defs/Permission" }
+      }
+    },
+    "Claim": {
+      "type": "object",
+      "required": ["id", "subject", "predicate", "object", "confidence", "source_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "subject": { "type": "string" },
+        "predicate": { "type": "string" },
+        "object": { "type": "string" },
+        "valid_time": { "$ref": "#/$defs/TimeInterval" },
+        "transaction_time": { "$ref": "#/$defs/TimeInterval" },
+        "confidence": { "$ref": "#/$defs/Confidence" },
+        "source_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": ["candidate", "active", "retracted", "superseded", "disputed"]
+        }
+      }
+    },
+    "Evidence": {
+      "type": "object",
+      "required": ["source_id", "content_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": { "type": "string" },
+        "content_hash": { "type": "string" },
+        "uri": { "type": ["string", "null"] },
+        "excerpt": { "type": ["string", "null"] },
+        "redacted": { "type": "boolean", "default": false },
+        "trust_score": { "$ref": "#/$defs/Confidence" },
+        "taint_labels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "Belief": {
+      "type": "object",
+      "required": ["id", "claim_ids", "state"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "claim_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "preferred_claim_id": { "type": ["string", "null"] },
+        "state": {
+          "type": "string",
+          "enum": ["unknown", "supported", "contested", "contradicted", "revised"]
+        },
+        "explanation": { "type": "string" },
+        "known_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Timeline": {
+      "type": "object",
+      "required": ["id", "events"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "events": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TimelineEvent" }
+        }
+      }
+    },
+    "TimelineEvent": {
+      "type": "object",
+      "required": ["id", "time", "label"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "time": { "type": "string", "format": "date-time" },
+        "label": { "type": "string" },
+        "source_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "ContextPack": {
+      "type": "object",
+      "required": ["id", "query", "generated_at", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "query": { "type": "string" },
+        "generated_at": { "type": "string", "format": "date-time" },
+        "memories": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Memory" }
+        },
+        "claims": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Claim" }
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Evidence" }
+        },
+        "contradictions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Contradiction" }
+        },
+        "token_estimate": { "type": "integer", "minimum": 0 },
+        "citation_map": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "Contradiction": {
+      "type": "object",
+      "required": ["id", "claim_ids", "contradiction_type", "severity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "claim_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 2
+        },
+        "contradiction_type": { "type": "string" },
+        "severity": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"]
+        },
+        "explanation": { "type": "string" }
+      }
+    },
+    "CausalTrace": {
+      "type": "object",
+      "required": ["id", "causal_links"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "causal_links": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CausalLink" }
+        },
+        "confidence": { "$ref": "#/$defs/Confidence" }
+      }
+    },
+    "CausalLink": {
+      "type": "object",
+      "required": ["cause_event_id", "effect_event_id", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "cause_event_id": { "type": "string" },
+        "effect_event_id": { "type": "string" },
+        "mechanism": { "type": ["string", "null"] },
+        "confidence": { "$ref": "#/$defs/Confidence" },
+        "source_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "SimulationTrace": {
+      "type": "object",
+      "required": ["id", "scenario", "assumptions", "affected_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "scenario": { "type": "string" },
+        "assumptions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "affected_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "uncertainty": { "$ref": "#/$defs/Confidence" },
+        "explanation": { "type": "string" }
+      }
+    },
+    "CompressionRequest": {
+      "type": "object",
+      "required": ["target_tokens"],
+      "additionalProperties": false,
+      "properties": {
+        "target_tokens": { "type": "integer", "minimum": 1 },
+        "preserve_contradictions": { "type": "boolean", "default": true },
+        "preserve_citations": { "type": "boolean", "default": true }
+      }
+    },
+    "ShareRequest": {
+      "type": "object",
+      "required": ["target_scope"],
+      "additionalProperties": false,
+      "properties": {
+        "target_scope": { "type": "string" },
+        "memory_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "claim_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "AuditRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resource_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "since": { "type": "string", "format": "date-time" },
+        "until": { "type": "string", "format": "date-time" }
+      }
+    },
+    "AuditEvent": {
+      "type": "object",
+      "required": ["id", "actor", "operation", "allowed", "occurred_at"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "actor": { "$ref": "#/$defs/Actor" },
+        "operation": { "$ref": "#/$defs/Operation" },
+        "resource_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "allowed": { "type": "boolean" },
+        "decision_reason": { "type": "string" },
+        "occurred_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "RmpError": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "details": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "Confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  }
+}

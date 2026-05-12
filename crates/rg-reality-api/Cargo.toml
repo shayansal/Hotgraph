@@ -1,0 +1,25 @@
+[package]
+name = "rg-reality-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-agent-memory = { path = "../rg-agent-memory" }
+rg-agent-sim = { path = "../rg-agent-sim" }
+rg-ai = { path = "../rg-ai" }
+rg-causal = { path = "../rg-causal" }
+rg-core = { path = "../rg-core" }
+rg-governance = { path = "../rg-governance" }
+rg-index = { path = "../rg-index" }
+rg-query = { path = "../rg-query" }
+rg-retrieval-compiler = { path = "../rg-retrieval-compiler" }
+rg-storage = { path = "../rg-storage" }
+
+[dev-dependencies]
+rg-events = { path = "../rg-events" }
+
+[lints]
+workspace = true
+

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reality Graph Architect"
+  short_description: "Architecture guardrails for Reality Graph."
+  default_prompt: "Use the Reality Graph Architect skill when designing, implementing, or reviewing Reality Graph core, temporal semantics, indexes, APIs, ingestion, AI retrieval, benchmarks, or project checks."

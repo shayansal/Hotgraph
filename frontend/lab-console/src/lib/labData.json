@@ -1,0 +1,372 @@
+{
+  "metrics": [
+    {
+      "id": "retrieval-quality",
+      "label": "Retrieval quality",
+      "value": "91.8%",
+      "detail": "+3.2 pts vs vector-only on multi-hop evals",
+      "trend": "up",
+      "status": "healthy"
+    },
+    {
+      "id": "memory-health",
+      "label": "Memory health",
+      "value": "96.4%",
+      "detail": "active, permissioned, non-superseded memories",
+      "trend": "flat",
+      "status": "healthy"
+    },
+    {
+      "id": "contradiction-clusters",
+      "label": "Contradiction clusters",
+      "value": "18",
+      "detail": "4 critical clusters need review",
+      "trend": "up",
+      "status": "watch"
+    },
+    {
+      "id": "stale-knowledge",
+      "label": "Stale knowledge",
+      "value": "2.7%",
+      "detail": "assertions beyond source freshness policy",
+      "trend": "down",
+      "status": "healthy"
+    },
+    {
+      "id": "agent-memory-writes",
+      "label": "Agent memory writes",
+      "value": "43.2k",
+      "detail": "24h signed writes, 312 pending review",
+      "trend": "up",
+      "status": "healthy"
+    },
+    {
+      "id": "source-trust",
+      "label": "Source trust",
+      "value": "0.82",
+      "detail": "weighted by authority, reputation, corroboration",
+      "trend": "flat",
+      "status": "watch"
+    },
+    {
+      "id": "p95-latency",
+      "label": "P95 latency",
+      "value": "184 ms",
+      "detail": "hot recall and context-pack routes",
+      "trend": "down",
+      "status": "healthy"
+    },
+    {
+      "id": "cost-per-context",
+      "label": "Cost per context pack",
+      "value": "$0.014",
+      "detail": "compression level 3 median",
+      "trend": "down",
+      "status": "healthy"
+    },
+    {
+      "id": "poisoning-attempts",
+      "label": "Poisoning attempts",
+      "value": "27",
+      "detail": "all quarantined before memory promotion",
+      "trend": "up",
+      "status": "critical"
+    },
+    {
+      "id": "benchmark-score",
+      "label": "Benchmark score",
+      "value": "88.6",
+      "detail": "frontier-lab weighted suite",
+      "trend": "up",
+      "status": "healthy"
+    },
+    {
+      "id": "eval-regressions",
+      "label": "Eval regressions",
+      "value": "2",
+      "detail": "temporal QA and source trust drift",
+      "trend": "up",
+      "status": "watch"
+    }
+  ],
+  "views": [
+    {
+      "id": "eval-leaderboard",
+      "label": "Eval leaderboard",
+      "summary": "Compare Reality Graph against vector, keyword, hybrid, graph, and temporal baselines.",
+      "status": "healthy"
+    },
+    {
+      "id": "agent-memory-health",
+      "label": "Agent memory health",
+      "summary": "Inspect memory writes, stale memories, supersession, and permission denials by agent.",
+      "status": "healthy"
+    },
+    {
+      "id": "evidence-trace-explorer",
+      "label": "Evidence trace explorer",
+      "summary": "Follow retrieval operators from intent routing through citations and compression.",
+      "status": "healthy"
+    },
+    {
+      "id": "contradiction-map",
+      "label": "Contradiction map",
+      "summary": "Cluster unresolved conflicts by topic, severity, age, and preferred claim.",
+      "status": "watch"
+    },
+    {
+      "id": "source-trust-dashboard",
+      "label": "Source trust dashboard",
+      "summary": "Map issuers, signatures, authority, reputation, independence, and conflict rate.",
+      "status": "watch"
+    },
+    {
+      "id": "latency-cost-dashboard",
+      "label": "Latency/cost dashboard",
+      "summary": "Track p95 latency and cost per context pack by command route.",
+      "status": "healthy"
+    },
+    {
+      "id": "security-incidents",
+      "label": "Security incidents",
+      "summary": "Review prompt injection, poisoned sources, exfiltration attempts, and blocked writes.",
+      "status": "critical"
+    },
+    {
+      "id": "graph-growth-compaction",
+      "label": "Graph growth and compaction",
+      "summary": "Monitor event volume, assertion growth, snapshot size, and compaction lag.",
+      "status": "healthy"
+    }
+  ],
+  "leaderboard": [
+    {
+      "name": "Reality Graph full stack",
+      "accuracy": 0.918,
+      "evidenceRecall": 0.942,
+      "temporalCorrectness": 0.961,
+      "latencyMs": 184,
+      "costUsd": 0.014
+    },
+    {
+      "name": "Temporal graph retrieval",
+      "accuracy": 0.843,
+      "evidenceRecall": 0.881,
+      "temporalCorrectness": 0.917,
+      "latencyMs": 221,
+      "costUsd": 0.011
+    },
+    {
+      "name": "Hybrid search",
+      "accuracy": 0.789,
+      "evidenceRecall": 0.812,
+      "temporalCorrectness": 0.704,
+      "latencyMs": 138,
+      "costUsd": 0.009
+    },
+    {
+      "name": "Vector-only RAG",
+      "accuracy": 0.712,
+      "evidenceRecall": 0.764,
+      "temporalCorrectness": 0.533,
+      "latencyMs": 96,
+      "costUsd": 0.007
+    }
+  ],
+  "memoryHealth": [
+    {
+      "agent": "research-scout-7",
+      "activeMemories": 18342,
+      "writes24h": 4202,
+      "stalePercent": 1.8,
+      "supersededPercent": 3.4,
+      "permissionDenials": 18,
+      "status": "healthy"
+    },
+    {
+      "agent": "coding-lab-codex",
+      "activeMemories": 6421,
+      "writes24h": 1308,
+      "stalePercent": 2.4,
+      "supersededPercent": 8.9,
+      "permissionDenials": 4,
+      "status": "healthy"
+    },
+    {
+      "agent": "ops-watchtower",
+      "activeMemories": 29401,
+      "writes24h": 8276,
+      "stalePercent": 6.8,
+      "supersededPercent": 12.2,
+      "permissionDenials": 71,
+      "status": "watch"
+    }
+  ],
+  "evidenceTrace": [
+    {
+      "operator": "IntentRouter",
+      "reason": "historical multi-hop claim verification",
+      "inputs": 1,
+      "outputs": 3,
+      "latencyMs": 7
+    },
+    {
+      "operator": "TemporalFilter",
+      "reason": "valid_at 2024-01-01 and known_at 2026-05-12",
+      "inputs": 12043,
+      "outputs": 1834,
+      "latencyMs": 24
+    },
+    {
+      "operator": "GraphExpansion",
+      "reason": "relationship question with entity endpoints",
+      "inputs": 1834,
+      "outputs": 412,
+      "latencyMs": 39
+    },
+    {
+      "operator": "ContradictionCheck",
+      "reason": "overlapping CEO_OF and acquisition status claims",
+      "inputs": 412,
+      "outputs": 18,
+      "latencyMs": 31
+    },
+    {
+      "operator": "Compress",
+      "reason": "fit 6k token policy while preserving citations",
+      "inputs": 18,
+      "outputs": 7,
+      "latencyMs": 19
+    }
+  ],
+  "contradictionClusters": [
+    {
+      "id": "conflict-acq-042",
+      "topic": "Aster Dynamics acquisition close date",
+      "claims": 6,
+      "severity": "critical",
+      "openAgeHours": 41,
+      "preferredClaim": "announced Mar 1, closed Jun 30"
+    },
+    {
+      "id": "conflict-ceo-119",
+      "topic": "Northstar Labs active CEO",
+      "claims": 4,
+      "severity": "watch",
+      "openAgeHours": 17,
+      "preferredClaim": "Mira Patel until board filing update"
+    },
+    {
+      "id": "conflict-supply-088",
+      "topic": "HelioFab supplier dependency",
+      "claims": 5,
+      "severity": "critical",
+      "openAgeHours": 9,
+      "preferredClaim": "treat dependency as uncertain"
+    }
+  ],
+  "sourceTrust": [
+    {
+      "source": "SEC 8-K filing",
+      "issuer": "sec.gov",
+      "authority": 0.97,
+      "reputation": 0.94,
+      "independence": 0.91,
+      "conflictRate": 0.03,
+      "signature": "verified"
+    },
+    {
+      "source": "Vendor status email",
+      "issuer": "regional-supplier.example",
+      "authority": 0.62,
+      "reputation": 0.71,
+      "independence": 0.54,
+      "conflictRate": 0.22,
+      "signature": "missing"
+    },
+    {
+      "source": "Analyst summary thread",
+      "issuer": "market-watchdesk",
+      "authority": 0.74,
+      "reputation": 0.69,
+      "independence": 0.47,
+      "conflictRate": 0.31,
+      "signature": "verified"
+    }
+  ],
+  "latencyCost": [
+    {
+      "route": "/recall",
+      "p95Ms": 28,
+      "costUsd": 0.003,
+      "status": "healthy"
+    },
+    {
+      "route": "/context",
+      "p95Ms": 184,
+      "costUsd": 0.014,
+      "status": "healthy"
+    },
+    {
+      "route": "/verify",
+      "p95Ms": 211,
+      "costUsd": 0.018,
+      "status": "watch"
+    },
+    {
+      "route": "/simulate",
+      "p95Ms": 612,
+      "costUsd": 0.041,
+      "status": "watch"
+    }
+  ],
+  "securityIncidents": [
+    {
+      "id": "sec-391",
+      "type": "poisoned document ingestion",
+      "source": "uploaded vendor PDF",
+      "blockedAt": "2026-05-12T05:17:00Z",
+      "status": "critical"
+    },
+    {
+      "id": "sec-407",
+      "type": "prompt injection in source text",
+      "source": "web crawl batch 22",
+      "blockedAt": "2026-05-12T06:48:00Z",
+      "status": "critical"
+    },
+    {
+      "id": "sec-411",
+      "type": "cross-tenant memory exfiltration attempt",
+      "source": "agent tool call",
+      "blockedAt": "2026-05-12T07:22:00Z",
+      "status": "watch"
+    }
+  ],
+  "graphGrowth": [
+    {
+      "label": "Last hour",
+      "events": "18.4M",
+      "assertions": "5.2M",
+      "snapshotSize": "82 GB",
+      "compactionLag": "11 min",
+      "status": "healthy"
+    },
+    {
+      "label": "24 hours",
+      "events": "322M",
+      "assertions": "91M",
+      "snapshotSize": "1.4 TB",
+      "compactionLag": "19 min",
+      "status": "healthy"
+    },
+    {
+      "label": "7 days",
+      "events": "2.1B",
+      "assertions": "604M",
+      "snapshotSize": "8.6 TB",
+      "compactionLag": "47 min",
+      "status": "watch"
+    }
+  ]
+}

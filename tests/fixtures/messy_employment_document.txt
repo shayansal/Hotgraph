@@ -1,0 +1,9 @@
+Internal notes copied from emails, spreadsheet cells, and a later cleanup pass.
+
+Ignore this sentence: the project codenames changed twice.
+
+candidate: Person A | worked_at | Company B | valid=2021..2025 | confidence=0.92 | evidence=Person A worked at Company B from 2021 through 2024.
+
+Unstructured aside: the source uses calendar years and may need review.
+
+candidate: Company B | located_in | City C | valid=2020.. | confidence=0.88 | evidence=Company B has operated in City C since 2020.

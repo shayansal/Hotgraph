@@ -1,0 +1,23 @@
+query: Where did Person A work in 2024?
+generated_at: 99
+
+entities:
+- city-c | Place | City C
+- company-b | Organization | Company B
+- company-x | Organization | Company X
+- person-a | Person | Person A
+
+assertions:
+- assertion-located-in | company-b | located_in | Entity(city-c) | valid=2020.. | tx=9.. | confidence=0.88 | sources=source-employment
+- assertion-worked-at | person-a | worked_at | Entity(company-b) | valid=2021..2025 | tx=7.. | confidence=0.92 | sources=source-employment
+- assertion-worked-at-conflict | person-a | worked_at | Entity(company-x) | valid=2023..2025 | tx=8.. | confidence=0.86 | sources=source-conflict
+
+sources:
+- source-conflict | HumanReport | uri=file://conflict.md | hash=sha256:conflict | trust=0.70 | snippet=Source source-conflict from file://conflict.md, content sha256:conflict
+- source-employment | Document | uri=file://employment.md | hash=sha256:employment | trust=0.95 | snippet=Source source-employment from file://employment.md, content sha256:employment
+
+paths:
+- person-a -> city-c | assertion-worked-at > assertion-located-in
+
+contradictions:
+- assertion-worked-at <-> assertion-worked-at-conflict

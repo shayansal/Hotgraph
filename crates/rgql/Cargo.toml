@@ -1,0 +1,19 @@
+[package]
+name = "rgql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-ai = { path = "../rg-ai" }
+rg-causal = { path = "../rg-causal" }
+rg-core = { path = "../rg-core" }
+rg-index = { path = "../rg-index" }
+rg-query = { path = "../rg-query" }
+rg-retrieval-compiler = { path = "../rg-retrieval-compiler" }
+rg-storage = { path = "../rg-storage" }
+
+[dev-dependencies]
+proptest = "1"
+rg-events = { path = "../rg-events" }

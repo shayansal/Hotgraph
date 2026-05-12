@@ -1,0 +1,5 @@
+# Reality Graph contradiction ontology.
+# Each non-comment line declares a mutually exclusive predicate pair.
+
+status_acquired | status_independent
+relationship_active | relationship_retracted

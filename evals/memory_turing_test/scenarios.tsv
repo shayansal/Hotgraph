@@ -1,0 +1,61 @@
+# id	family	category	sessions	token_budget	correction	redaction	contradiction	tenant_isolation	planning	explain	current_truth	old_truth
+exec-1000	executive_assistant	remembers_facts_across_1000_sessions	1000	900	false	false	false	false	false	false	Board package is due each Friday by 15:00.	Board package was ad hoc.
+exec-correct	executive_assistant	updates_beliefs_when_corrected	60	900	true	false	false	false	false	false	Use the CFO's updated Q3 narrative.	Use the old Q2 narrative.
+exec-old-current	executive_assistant	distinguishes_old_truth_from_current_truth	80	800	true	false	false	false	false	false	Current travel preference is rail for Berlin meetings.	Old preference was rideshare.
+exec-pref	executive_assistant	remembers_preferences_without_overgeneralizing	120	700	false	false	false	false	false	false	Use concise briefings for board prep only.	Concise briefings apply everywhere.
+exec-redact	executive_assistant	forgets_redacts_when_instructed	40	700	false	true	false	false	false	false	Redacted investor phone number must not be returned.	Investor phone number was remembered.
+exec-budget	executive_assistant	retrieves_relevant_context_under_token_budget	200	280	false	false	false	false	false	false	Return only renewal, board, and travel preferences.	Return all meeting transcript details.
+exec-conflict	executive_assistant	handles_contradictory_memories	90	800	false	false	true	false	false	false	Two sources conflict on the board date; mark unresolved.	Board date is definitely Monday.
+exec-explain	executive_assistant	explains_why_it_remembers_something	75	800	false	false	false	false	false	true	Remembered because it came from signed board-prep notes.	Remembered for no reason.
+exec-plan	executive_assistant	uses_memory_in_planning	160	900	false	false	false	false	true	false	Schedule rail travel before drafting the board package.	Draft package before checking travel.
+exec-tenant	executive_assistant	avoids_cross_user_memory_leakage	100	900	false	false	false	true	false	false	Only tenant-a executive preferences are visible.	Tenant-b preferences leak into tenant-a.
+code-1000	coding_agent	remembers_facts_across_1000_sessions	1000	900	false	false	false	false	false	false	Project Atlas deploys through blue-green release gates.	Project Atlas deploys manually.
+code-correct	coding_agent	updates_beliefs_when_corrected	70	900	true	false	false	false	false	false	Use Rust 1.78 compatibility for the workspace.	Use nightly-only APIs.
+code-old-current	coding_agent	distinguishes_old_truth_from_current_truth	90	800	true	false	false	false	false	false	Current API auth is service-account token auth.	Old API auth was static key auth.
+code-pref	coding_agent	remembers_preferences_without_overgeneralizing	110	700	false	false	false	false	false	false	Use terse PR summaries for infrastructure changes only.	Use terse summaries for every response.
+code-redact	coding_agent	forgets_redacts_when_instructed	50	700	false	true	false	false	false	false	Redacted staging token must not appear in context.	Staging token remains in memory.
+code-budget	coding_agent	retrieves_relevant_context_under_token_budget	220	260	false	false	false	false	false	false	Return only repo, test, and deployment memories.	Return entire coding conversation.
+code-conflict	coding_agent	handles_contradictory_memories	95	800	false	false	true	false	false	false	Two memories conflict on the database owner; surface both.	Database owner is definitely Team X.
+code-explain	coding_agent	explains_why_it_remembers_something	85	800	false	false	false	false	false	true	Remembered from merged PR review and signed ADR.	Remembered from transcript vibes.
+code-plan	coding_agent	uses_memory_in_planning	170	900	false	false	false	false	true	false	Run cargo fmt, clippy, tests before proposing release.	Ship without checks.
+code-tenant	coding_agent	avoids_cross_user_memory_leakage	130	900	false	false	false	true	false	false	Customer A repo secrets never appear in Customer B context.	Cross-customer repo memory is visible.
+research-1000	research_assistant	remembers_facts_across_1000_sessions	1000	900	false	false	false	false	false	false	The literature review tracks temporal graph benchmarks.	The review tracks only vector search.
+research-correct	research_assistant	updates_beliefs_when_corrected	65	900	true	false	false	false	false	false	Use the corrected publication year 2026.	Use the mistaken year 2024.
+research-old-current	research_assistant	distinguishes_old_truth_from_current_truth	95	800	true	false	false	false	false	false	Current hypothesis favors adaptive retrieval.	Old hypothesis favored graph-only retrieval.
+research-pref	research_assistant	remembers_preferences_without_overgeneralizing	115	700	false	false	false	false	false	false	Use Chicago citations for legal-history notes only.	Use Chicago citations for all notes.
+research-redact	research_assistant	forgets_redacts_when_instructed	45	700	false	true	false	false	false	false	Redacted interviewee identity must not be retrieved.	Interviewee name remains accessible.
+research-budget	research_assistant	retrieves_relevant_context_under_token_budget	230	250	false	false	false	false	false	false	Return only benchmark, citation, and hypothesis memories.	Return full reading history.
+research-conflict	research_assistant	handles_contradictory_memories	100	800	false	false	true	false	false	false	Conflicting sources disagree on sample size; preserve both.	Sample size is certainly 1,200.
+research-explain	research_assistant	explains_why_it_remembers_something	88	800	false	false	false	false	false	true	Remembered from signed extraction notes and source IDs.	Remembered without provenance.
+research-plan	research_assistant	uses_memory_in_planning	175	900	false	false	false	false	true	false	Prioritize temporal QA eval before broad RAG claims.	Prioritize broad claims before eval.
+research-tenant	research_assistant	avoids_cross_user_memory_leakage	125	900	false	false	false	true	false	false	Lab A unpublished notes never leak into Lab B project.	Lab A notes appear in Lab B answer.
+support-1000	customer_support	remembers_facts_across_1000_sessions	1000	900	false	false	false	false	false	false	Customer renews on enterprise plan each September.	Customer renews monthly.
+support-correct	customer_support	updates_beliefs_when_corrected	70	900	true	false	false	false	false	false	Correct escalation owner is Support Lead B.	Old owner was Support Lead A.
+support-old-current	customer_support	distinguishes_old_truth_from_current_truth	100	800	true	false	false	false	false	false	Current SLA is platinum after upgrade.	Old SLA was standard.
+support-pref	customer_support	remembers_preferences_without_overgeneralizing	105	700	false	false	false	false	false	false	Use phone follow-up only for outage incidents.	Use phone follow-up for every ticket.
+support-redact	customer_support	forgets_redacts_when_instructed	55	700	false	true	false	false	false	false	Deleted payment card note must not be returned.	Payment card note remains visible.
+support-budget	customer_support	retrieves_relevant_context_under_token_budget	240	260	false	false	false	false	false	false	Return only SLA, escalation, and outage memories.	Return all customer chat history.
+support-conflict	customer_support	handles_contradictory_memories	102	800	false	false	true	false	false	false	Two tickets conflict on outage start; mark disputed.	Outage started at exactly 09:00.
+support-explain	customer_support	explains_why_it_remembers_something	87	800	false	false	false	false	false	true	Remembered from signed case note and incident source.	Remembered because it was recent.
+support-plan	customer_support	uses_memory_in_planning	180	900	false	false	false	false	true	false	Escalate to Support Lead B before renewal response.	Respond without escalation.
+support-tenant	customer_support	avoids_cross_user_memory_leakage	140	900	false	false	false	true	false	false	Customer X ticket memory never appears for Customer Y.	Customer X ticket details leak to Y.
+personal-1000	personal_ai	remembers_facts_across_1000_sessions	1000	900	false	false	false	false	false	false	User's passport renewal reminder is due in August.	Passport reminder is due in May.
+personal-correct	personal_ai	updates_beliefs_when_corrected	68	900	true	false	false	false	false	false	Correct allergy memory excludes almonds.	Old memory said almond allergy.
+personal-old-current	personal_ai	distinguishes_old_truth_from_current_truth	92	800	true	false	false	false	false	false	Current commute preference is bicycle.	Old commute preference was train.
+personal-pref	personal_ai	remembers_preferences_without_overgeneralizing	118	700	false	false	false	false	false	false	Prefer vegetarian options for weekday lunches only.	Prefer vegetarian options for every meal.
+personal-redact	personal_ai	forgets_redacts_when_instructed	52	700	false	true	false	false	false	false	Deleted home address must not be retrieved.	Home address remains visible.
+personal-budget	personal_ai	retrieves_relevant_context_under_token_budget	210	250	false	false	false	false	false	false	Return only calendar, diet, and travel preferences.	Return every personal note.
+personal-conflict	personal_ai	handles_contradictory_memories	96	800	false	false	true	false	false	false	Conflicting appointment times must be shown as disputed.	Appointment is definitely at 14:00.
+personal-explain	personal_ai	explains_why_it_remembers_something	84	800	false	false	false	false	false	true	Remembered because user confirmed it twice with source notes.	Remembered without confirmation.
+personal-plan	personal_ai	uses_memory_in_planning	172	900	false	false	false	false	true	false	Plan lunch around weekday vegetarian preference.	Ignore food preference.
+personal-tenant	personal_ai	avoids_cross_user_memory_leakage	120	900	false	false	false	true	false	false	Household member memories stay scoped by user.	Another user preference leaks.
+ops-1000	enterprise_operations	remembers_facts_across_1000_sessions	1000	900	false	false	false	false	false	false	Region eu-central-1 owns payment failover.	Region us-east-1 owns payment failover.
+ops-correct	enterprise_operations	updates_beliefs_when_corrected	72	900	true	false	false	false	false	false	Correct on-call rotation starts with Team Blue.	Old rotation starts with Team Red.
+ops-old-current	enterprise_operations	distinguishes_old_truth_from_current_truth	98	800	true	false	false	false	false	false	Current incident status is mitigated.	Old status was investigating.
+ops-pref	enterprise_operations	remembers_preferences_without_overgeneralizing	112	700	false	false	false	false	false	false	Page security only for customer-impacting incidents.	Page security for every alert.
+ops-redact	enterprise_operations	forgets_redacts_when_instructed	58	700	false	true	false	false	false	false	Deleted vendor secret must not be returned.	Vendor secret remains visible.
+ops-budget	enterprise_operations	retrieves_relevant_context_under_token_budget	250	250	false	false	false	false	false	false	Return only failover, on-call, and incident memories.	Return entire operations log.
+ops-conflict	enterprise_operations	handles_contradictory_memories	108	800	false	false	true	false	false	false	Conflicting incident timelines must both be cited.	Incident timeline is definitely single-source.
+ops-explain	enterprise_operations	explains_why_it_remembers_something	90	800	false	false	false	false	false	true	Remembered from signed runbook and incident event.	Remembered from stale chat.
+ops-plan	enterprise_operations	uses_memory_in_planning	185	900	false	false	false	false	true	false	Check Team Blue on-call and eu-central failover before action.	Action without checking on-call.
+ops-tenant	enterprise_operations	avoids_cross_user_memory_leakage	150	900	false	false	false	true	false	false	Tenant-specific incident memory remains isolated.	Another tenant incident leaks.

@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reality-graph-config
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: reality-graph
+data:
+  RG_API_ADDR: "0.0.0.0:8080"
+  RUST_LOG: "info,rg_api=debug"
+  QDRANT_URL: "http://qdrant:6334"
+  OBJECT_STORAGE_ENDPOINT: "http://object-storage:9000"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      - job_name: reality-graph-api
+        metrics_path: /v1/metrics
+        static_configs:
+          - targets:
+              - reality-graph-api:8080
+
+      - job_name: reality-graph-worker
+        metrics_path: /v1/metrics
+        static_configs:
+          - targets:
+              - reality-graph-worker:8081
+
+      - job_name: prometheus
+        static_configs:
+          - targets:
+              - localhost:9090
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: grafana
+data:
+  prometheus-datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        editable: true

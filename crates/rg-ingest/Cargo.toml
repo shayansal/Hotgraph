@@ -1,0 +1,13 @@
+[package]
+name = "rg-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-events = { path = "../rg-events" }
+rg-storage = { path = "../rg-storage" }
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+entity_types:
+  Person:
+    properties:
+      name: string
+      birth_date: date
+
+  Company:
+    properties:
+      name: string
+      jurisdiction: string
+
+predicates:
+  WORKED_AT:
+    subject: Person
+    object: Company
+    temporal: true
+    mutually_exclusive_with: []
+
+  CEO_OF:
+    subject: Person
+    object: Company
+    temporal: true
+    constraints:
+      max_active_objects_per_subject: 1
+
+  OWNS:
+    subject: Entity
+    object: Entity
+    temporal: true
+    properties:
+      percentage: float

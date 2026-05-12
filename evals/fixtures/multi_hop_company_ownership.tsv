@@ -1,0 +1,5 @@
+dataset:multi_hop_company_ownership
+case:ownership-multihop-control|Who ultimately controls Company C through ownership?|Company A|20240101|20260511|multi_hop|own-a-b,own-b-c|path-control-a-c|
+evidence:own-a-b|company-a|OWNS|company-b|20200101||20260511|Company A owns Company B.
+evidence:own-b-c|company-b|OWNS|company-c|20200101||20260511|Company B owns Company C.
+path:path-control-a-c|own-a-b,own-b-c

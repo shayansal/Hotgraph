@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package reality_graph.v1;
+
+message Node {
+  string id = 1;
+}
+
+message Fact {
+  string subject = 1;
+  string predicate = 2;
+  string object = 3;
+  int64 observed_at_micros = 4;
+}

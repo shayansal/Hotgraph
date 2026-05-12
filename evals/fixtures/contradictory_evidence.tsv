@@ -1,0 +1,5 @@
+dataset:contradictory_evidence
+case:contradictory-ceo-overlap|Was Person A CEO of more than one company in 2024?|Conflicting CEO assertions|20240601|20260511|contradiction,temporal_qa|ceo-a-b,ceo-a-c||contradiction-ceo-overlap
+evidence:ceo-a-b|person-a|CEO_OF|company-b|20230101|20250101|20260511|Source one says Person A was CEO of Company B during 2024.
+evidence:ceo-a-c|person-a|CEO_OF|company-c|20240101|20260101|20260511|Source two says Person A was CEO of Company C during the same period.
+contradiction:contradiction-ceo-overlap|ceo-a-b|ceo-a-c|mutually_exclusive_active_role

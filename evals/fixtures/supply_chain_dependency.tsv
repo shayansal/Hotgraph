@@ -1,0 +1,5 @@
+dataset:supply_chain_dependency
+case:supply-chain-affected-contracts|Which customer is affected if Supplier A stops supplying Company B?|Customer C|20260101|20260511|counterfactual,supply_chain,multi_hop|supply-a-b,contract-b-c|path-supply-impact|
+evidence:supply-a-b|supplier-a|SUPPLIES|company-b|20200101||20260511|Supplier A supplies Company B with battery cells.
+evidence:contract-b-c|company-b|HAS_CONTRACT_WITH|customer-c|20200101||20260511|Company B has a dependent delivery contract with Customer C.
+path:path-supply-impact|supply-a-b,contract-b-c

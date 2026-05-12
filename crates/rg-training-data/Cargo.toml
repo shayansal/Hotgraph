@@ -1,0 +1,12 @@
+[package]
+name = "rg-training-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

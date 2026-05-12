@@ -1,0 +1,13 @@
+[package]
+name = "rg-confidential"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-ai = { path = "../rg-ai" }
+rg-core = { path = "../rg-core" }
+
+[lints]
+workspace = true

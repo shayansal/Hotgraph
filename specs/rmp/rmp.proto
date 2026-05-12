@@ -1,0 +1,246 @@
+syntax = "proto3";
+
+package reality_graph.rmp.v1;
+
+service RealityMemoryProtocol {
+  rpc Exchange(RmpEnvelope) returns (RmpEnvelope);
+  rpc Remember(RmpEnvelope) returns (RmpEnvelope);
+  rpc Recall(RmpEnvelope) returns (RmpEnvelope);
+  rpc Verify(RmpEnvelope) returns (RmpEnvelope);
+  rpc Revise(RmpEnvelope) returns (RmpEnvelope);
+  rpc Forget(RmpEnvelope) returns (RmpEnvelope);
+  rpc Explain(RmpEnvelope) returns (RmpEnvelope);
+  rpc Simulate(RmpEnvelope) returns (RmpEnvelope);
+  rpc Ground(RmpEnvelope) returns (RmpEnvelope);
+  rpc Compress(RmpEnvelope) returns (RmpEnvelope);
+  rpc Share(RmpEnvelope) returns (RmpEnvelope);
+  rpc Audit(RmpEnvelope) returns (RmpEnvelope);
+}
+
+message RmpEnvelope {
+  string protocol = 1;
+  string version = 2;
+  Operation operation = 3;
+  string request_id = 4;
+  string idempotency_key = 5;
+  Actor actor = 6;
+  TemporalContext temporal_context = 7;
+  Permission permission_context = 8;
+  RmpRequest request = 9;
+  RmpResponse response = 10;
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  REMEMBER = 1;
+  RECALL = 2;
+  VERIFY = 3;
+  REVISE = 4;
+  FORGET = 5;
+  EXPLAIN = 6;
+  SIMULATE = 7;
+  GROUND = 8;
+  COMPRESS = 9;
+  SHARE = 10;
+  AUDIT = 11;
+}
+
+message Actor {
+  string principal_id = 1;
+  string agent_id = 2;
+  string tenant_id = 3;
+  string session_id = 4;
+  string client_name = 5;
+}
+
+message TemporalContext {
+  string valid_at = 1;
+  string known_at = 2;
+  TimeInterval valid_during = 3;
+  TimeInterval tx_during = 4;
+}
+
+message TimeInterval {
+  string from = 1;
+  string to = 2;
+}
+
+message Permission {
+  string scope = 1;
+  repeated Operation capabilities = 2;
+  string source_policy = 3;
+  string memory_policy = 4;
+  string redaction_policy = 5;
+  string share_policy = 6;
+  bool requires_human_review = 7;
+}
+
+message RmpRequest {
+  string query = 1;
+  string question = 2;
+  string task = 3;
+  Claim claim = 4;
+  Memory memory = 5;
+  repeated Evidence evidence = 6;
+  repeated string target_ids = 7;
+  ContextPack context_pack = 8;
+  SimulationTrace simulation = 9;
+  CompressionRequest compression = 10;
+  ShareRequest share = 11;
+  AuditRequest audit = 12;
+}
+
+message RmpResponse {
+  string status = 1;
+  repeated Memory memories = 2;
+  repeated Claim claims = 3;
+  repeated Belief beliefs = 4;
+  repeated Evidence evidence = 5;
+  Timeline timeline = 6;
+  ContextPack context_pack = 7;
+  repeated Contradiction contradictions = 8;
+  CausalTrace causal_trace = 9;
+  SimulationTrace simulation_trace = 10;
+  repeated Permission permissions = 11;
+  repeated AuditEvent audit_events = 12;
+  repeated string warnings = 13;
+  RmpError error = 14;
+}
+
+message Memory {
+  string id = 1;
+  string agent_id = 2;
+  string memory_type = 3;
+  string content = 4;
+  TimeInterval valid_time = 5;
+  float confidence = 6;
+  repeated string source_ids = 7;
+  repeated string related_entity_ids = 8;
+  repeated string supersedes = 9;
+  string lifecycle = 10;
+  Permission permission = 11;
+}
+
+message Claim {
+  string id = 1;
+  string subject = 2;
+  string predicate = 3;
+  string object = 4;
+  TimeInterval valid_time = 5;
+  TimeInterval transaction_time = 6;
+  float confidence = 7;
+  repeated string source_ids = 8;
+  string status = 9;
+}
+
+message Evidence {
+  string source_id = 1;
+  string content_hash = 2;
+  string uri = 3;
+  string excerpt = 4;
+  bool redacted = 5;
+  float trust_score = 6;
+  repeated string taint_labels = 7;
+}
+
+message Belief {
+  string id = 1;
+  repeated string claim_ids = 2;
+  string preferred_claim_id = 3;
+  string state = 4;
+  string explanation = 5;
+  string known_at = 6;
+}
+
+message Timeline {
+  string id = 1;
+  repeated TimelineEvent events = 2;
+}
+
+message TimelineEvent {
+  string id = 1;
+  string time = 2;
+  string label = 3;
+  repeated string source_ids = 4;
+}
+
+message ContextPack {
+  string id = 1;
+  string query = 2;
+  string generated_at = 3;
+  repeated Memory memories = 4;
+  repeated Claim claims = 5;
+  repeated Evidence evidence = 6;
+  repeated Contradiction contradictions = 7;
+  uint64 token_estimate = 8;
+  repeated Citation citations = 9;
+}
+
+message Citation {
+  string claim_id = 1;
+  repeated string source_ids = 2;
+}
+
+message Contradiction {
+  string id = 1;
+  repeated string claim_ids = 2;
+  string contradiction_type = 3;
+  string severity = 4;
+  string explanation = 5;
+}
+
+message CausalTrace {
+  string id = 1;
+  repeated CausalLink causal_links = 2;
+  float confidence = 3;
+}
+
+message CausalLink {
+  string cause_event_id = 1;
+  string effect_event_id = 2;
+  string mechanism = 3;
+  float confidence = 4;
+  repeated string source_ids = 5;
+}
+
+message SimulationTrace {
+  string id = 1;
+  string scenario = 2;
+  repeated string assumptions = 3;
+  repeated string affected_ids = 4;
+  float uncertainty = 5;
+  string explanation = 6;
+}
+
+message CompressionRequest {
+  uint64 target_tokens = 1;
+  bool preserve_contradictions = 2;
+  bool preserve_citations = 3;
+}
+
+message ShareRequest {
+  string target_scope = 1;
+  repeated string memory_ids = 2;
+  repeated string claim_ids = 3;
+}
+
+message AuditRequest {
+  repeated string resource_ids = 1;
+  string since = 2;
+  string until = 3;
+}
+
+message AuditEvent {
+  string id = 1;
+  Actor actor = 2;
+  Operation operation = 3;
+  repeated string resource_ids = 4;
+  bool allowed = 5;
+  string decision_reason = 6;
+  string occurred_at = 7;
+}
+
+message RmpError {
+  string code = 1;
+  string message = 2;
+}

@@ -1,0 +1,251 @@
+openapi: 3.1.0
+info:
+  title: Reality Memory Protocol
+  version: 1.0.0
+  description: Model-native memory protocol for Reality Graph.
+servers:
+  - url: http://localhost:8080
+paths:
+  /rmp/v1/capabilities:
+    get:
+      operationId: rmpCapabilities
+      summary: Negotiate RMP versions and capabilities.
+      responses:
+        "200":
+          description: Supported RMP capabilities.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RmpCapabilities"
+  /rmp/v1/exchange:
+    post:
+      operationId: rmpExchange
+      summary: Execute any RMP operation.
+      parameters:
+        - $ref: "#/components/parameters/RmpVersion"
+        - $ref: "#/components/parameters/RmpMinVersion"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/rmp+json:
+            schema:
+              $ref: "#/components/schemas/RmpEnvelope"
+      responses:
+        "200":
+          $ref: "#/components/responses/RmpEnvelopeResponse"
+        "202":
+          $ref: "#/components/responses/RmpEnvelopeResponse"
+        "400":
+          $ref: "#/components/responses/RmpErrorResponse"
+        "403":
+          $ref: "#/components/responses/RmpErrorResponse"
+        "409":
+          $ref: "#/components/responses/RmpErrorResponse"
+        "426":
+          $ref: "#/components/responses/RmpErrorResponse"
+  /rmp/v1/{operation}:
+    post:
+      operationId: rmpOperation
+      summary: Execute one named RMP operation.
+      parameters:
+        - name: operation
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/OperationSlug"
+        - $ref: "#/components/parameters/RmpVersion"
+        - $ref: "#/components/parameters/RmpMinVersion"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/rmp+json:
+            schema:
+              $ref: "#/components/schemas/RmpEnvelope"
+      responses:
+        "200":
+          $ref: "#/components/responses/RmpEnvelopeResponse"
+        "202":
+          $ref: "#/components/responses/RmpEnvelopeResponse"
+        "400":
+          $ref: "#/components/responses/RmpErrorResponse"
+        "403":
+          $ref: "#/components/responses/RmpErrorResponse"
+        "409":
+          $ref: "#/components/responses/RmpErrorResponse"
+        "426":
+          $ref: "#/components/responses/RmpErrorResponse"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    RmpVersion:
+      name: RMP-Version
+      in: header
+      required: false
+      schema:
+        type: string
+        example: 1.0.0
+    RmpMinVersion:
+      name: RMP-Min-Version
+      in: header
+      required: false
+      schema:
+        type: string
+        example: 1.0.0
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+  responses:
+    RmpEnvelopeResponse:
+      description: RMP envelope response.
+      content:
+        application/rmp+json:
+          schema:
+            $ref: "#/components/schemas/RmpEnvelope"
+    RmpErrorResponse:
+      description: RMP error response.
+      content:
+        application/rmp+json:
+          schema:
+            $ref: "#/components/schemas/RmpEnvelope"
+  schemas:
+    OperationSlug:
+      type: string
+      enum:
+        - remember
+        - recall
+        - verify
+        - revise
+        - forget
+        - explain
+        - simulate
+        - ground
+        - compress
+        - share
+        - audit
+    RmpCapabilities:
+      type: object
+      required:
+        - versions
+        - operations
+        - objects
+      properties:
+        versions:
+          type: array
+          items:
+            type: string
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Operation"
+        objects:
+          type: array
+          items:
+            type: string
+        mcp_mapping_version:
+          type: string
+        protobuf_package:
+          type: string
+        no_raw_source_supported:
+          type: boolean
+    RmpEnvelope:
+      type: object
+      required:
+        - protocol
+        - version
+        - operation
+        - request_id
+        - actor
+        - request
+      properties:
+        protocol:
+          type: string
+          const: rmp
+        version:
+          type: string
+          example: 1.0.0
+        operation:
+          $ref: "#/components/schemas/Operation"
+        request_id:
+          type: string
+        idempotency_key:
+          type: string
+        actor:
+          $ref: "#/components/schemas/Actor"
+        temporal_context:
+          $ref: "#/components/schemas/TemporalContext"
+        permission_context:
+          $ref: "#/components/schemas/Permission"
+        request:
+          type: object
+          additionalProperties: true
+        response:
+          type: object
+          additionalProperties: true
+    Operation:
+      type: string
+      enum:
+        - REMEMBER
+        - RECALL
+        - VERIFY
+        - REVISE
+        - FORGET
+        - EXPLAIN
+        - SIMULATE
+        - GROUND
+        - COMPRESS
+        - SHARE
+        - AUDIT
+    Actor:
+      type: object
+      required:
+        - principal_id
+        - tenant_id
+      properties:
+        principal_id:
+          type: string
+        agent_id:
+          type: string
+        tenant_id:
+          type: string
+        session_id:
+          type: string
+        client_name:
+          type: string
+    TemporalContext:
+      type: object
+      properties:
+        valid_at:
+          type: string
+          format: date-time
+        known_at:
+          type: string
+          format: date-time
+    Permission:
+      type: object
+      properties:
+        scope:
+          type: string
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/Operation"
+        source_policy:
+          type: string
+        memory_policy:
+          type: string
+        redaction_policy:
+          type: string
+        share_policy:
+          type: string
+        requires_human_review:
+          type: boolean
+security:
+  - bearerAuth: []

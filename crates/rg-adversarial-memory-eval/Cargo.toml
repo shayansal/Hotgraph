@@ -1,0 +1,13 @@
+[package]
+name = "rg-adversarial-memory-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-agent-security = { path = "../rg-agent-security" }
+rg-core = { path = "../rg-core" }
+
+[lints]
+workspace = true

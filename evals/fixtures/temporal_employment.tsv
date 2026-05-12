@@ -1,0 +1,4 @@
+dataset:temporal_employment
+case:temporal-employment-2024|Where did Person A work in 2024?|Company B|20240101|20260511|temporal_qa|emp-a-b-2021||
+evidence:emp-a-b-2021|person-a|WORKED_AT|company-b|20210101|20250101|20260511|Person A worked at Company B from 2021 through 2024.
+evidence:emp-a-c-2019|person-a|WORKED_AT|company-c|20190101|20210101|20260511|Person A worked at Company C before joining Company B.

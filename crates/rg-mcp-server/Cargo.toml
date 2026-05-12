@@ -1,0 +1,20 @@
+[package]
+name = "rg-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-agent-memory = { path = "../rg-agent-memory" }
+rg-agent-security = { path = "../rg-agent-security" }
+rg-causal = { path = "../rg-causal" }
+rg-core = { path = "../rg-core" }
+rg-events = { path = "../rg-events" }
+rg-index = { path = "../rg-index" }
+rg-query = { path = "../rg-query" }
+rg-storage = { path = "../rg-storage" }
+serde_json = "1"
+
+[lints]
+workspace = true

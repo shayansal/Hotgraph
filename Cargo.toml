@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rg-core",
+    "crates/rg-kernel",
+    "crates/rg-events",
+    "crates/rg-storage",
+    "crates/rg-index",
+    "crates/rg-query",
+    "crates/rg-api",
+    "crates/rg-ai",
+    "crates/rg-ingest",
+    "crates/rg-ingest-multimodal",
+    "crates/rg-graphrag",
+    "crates/rg-memory-activation",
+    "crates/rg-agent-memory",
+    "crates/rg-cognitive-cache",
+    "crates/rg-belief",
+    "crates/rg-truth-maintenance",
+    "crates/rg-source-trust",
+    "crates/rg-temporal-reasoning",
+    "crates/rg-causal",
+    "crates/rg-maintenance",
+    "crates/rg-mcp-server",
+    "crates/rgql",
+    "crates/rg-context-compression",
+    "crates/rg-context-serving",
+    "crates/rg-learning",
+    "crates/rg-feedback-loop",
+    "crates/rg-training-data",
+    "crates/rg-worldgen",
+    "crates/reality-gym",
+    "crates/rg-multi-agent",
+    "crates/rg-active-knowledge",
+    "crates/rg-ontology-learning",
+    "crates/rg-distillation",
+    "crates/rg-federation",
+    "crates/rg-confidential",
+    "crates/rg-lab-deploy",
+    "crates/rg-runtime",
+    "crates/rg-governance",
+    "crates/rg-agent-sim",
+    "crates/rg-agent-security",
+    "crates/rg-agent-judge",
+    "crates/rg-reality-api",
+    "crates/rg-integrations",
+    "crates/rg-retrieval-compiler",
+    "crates/rg-eval",
+    "crates/rg-frontier-eval",
+    "crates/rg-memory-turing-test",
+    "crates/rg-adversarial-memory-eval",
+    "crates/rg-accelerated",
+    "crates/rg-bench",
+    "crates/rg-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.78"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

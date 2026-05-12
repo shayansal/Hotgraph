@@ -1,0 +1,13 @@
+[package]
+name = "reality-gym"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rg-core = { path = "../rg-core" }
+rg-worldgen = { path = "../rg-worldgen" }
+
+[lints]
+workspace = true
