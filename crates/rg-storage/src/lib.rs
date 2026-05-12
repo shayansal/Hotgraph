@@ -1,7 +1,7 @@
 //! Single-node storage primitives for Reality Graph.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -24,7 +24,8 @@ pub enum StorageError {
 }
 
 const EVENT_RECORD_KIND: &str = "RGEVENT";
-const EVENT_RECORD_VERSION: &str = "1";
+const LEGACY_EVENT_RECORD_VERSION: &str = "1";
+const EVENT_RECORD_VERSION: &str = "2";
 const SNAPSHOT_HEADER: &str = "RGSTORAGE-SNAPSHOT-V2";
 const LEGACY_SNAPSHOT_HEADER: &str = "RGSTORAGE-SNAPSHOT-V1";
 
@@ -258,47 +259,219 @@ where
 #[derive(Clone, Debug)]
 pub struct FileEventLog {
     path: PathBuf,
+    options: WalOptions,
 }
 
 impl FileEventLog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_options(path, WalOptions::new(FsyncPolicy::EveryWrite))
+    }
+
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        options: WalOptions,
+    ) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
         OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        Ok(Self { path })
+        Ok(Self { path, options })
     }
 
     pub fn append(&mut self, event: &GraphEvent) -> Result<(), StorageError> {
+        self.append_with_metadata(event, WalAppendMetadata::new())
+    }
+
+    pub fn append_with_metadata(
+        &mut self,
+        event: &GraphEvent,
+        metadata: WalAppendMetadata,
+    ) -> Result<(), StorageError> {
+        let sequence = self.next_sequence()?;
+        let record = WalRecord::new(sequence, event.clone(), metadata.idempotency_key);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        file.write_all(encode_event_record(event).as_bytes())
+        file.write_all(encode_event_record(&record).as_bytes())
             .map_err(|error| StorageError::Io(error.to_string()))?;
         file.write_all(b"\n")
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        file.sync_data()
-            .map_err(|error| StorageError::Io(error.to_string()))?;
+        if self.options.fsync_policy.should_sync(sequence) {
+            file.sync_data()
+                .map_err(|error| StorageError::Io(error.to_string()))?;
+        }
         Ok(())
     }
 
     pub fn read_all(&self) -> Result<Vec<GraphEvent>, StorageError> {
+        self.read_records()
+            .map(|records| records.into_iter().map(|record| record.event).collect())
+    }
+
+    pub fn read_records(&self) -> Result<Vec<WalRecord>, StorageError> {
         let file = File::open(&self.path).map_err(|error| StorageError::Io(error.to_string()))?;
         let reader = BufReader::new(file);
-        let mut events = Vec::new();
+        let mut records = Vec::new();
         for line in reader.lines() {
             let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            events.push(decode_event_record(&line)?);
+            let expected_sequence = records.len() as u64 + 1;
+            let record = decode_event_record(&line, expected_sequence)?;
+            records.push(record);
         }
-        Ok(events)
+        Ok(records)
     }
+
+    pub fn recover_truncate_to_last_good(&mut self) -> Result<WalRecoveryReport, StorageError> {
+        let bytes = fs::read(&self.path).map_err(|error| StorageError::Io(error.to_string()))?;
+        let mut start = 0_usize;
+        let mut last_good_end = 0_usize;
+        let mut records_recovered = 0_u64;
+        let mut corruption_reason = None;
+
+        while start < bytes.len() {
+            let Some(relative_end) = bytes[start..].iter().position(|byte| *byte == b'\n') else {
+                corruption_reason = Some("partial WAL record tail".to_owned());
+                break;
+            };
+            let end = start + relative_end + 1;
+            let line = String::from_utf8(bytes[start..end - 1].to_vec())
+                .map_err(|error| StorageError::Codec(error.to_string()))?;
+            if line.trim().is_empty() {
+                last_good_end = end;
+                start = end;
+                continue;
+            }
+            match decode_event_record(&line, records_recovered + 1) {
+                Ok(_) => {
+                    records_recovered += 1;
+                    last_good_end = end;
+                    start = end;
+                }
+                Err(error) => {
+                    corruption_reason = Some(format!("{error:?}"));
+                    break;
+                }
+            }
+        }
+
+        let bytes_quarantined = bytes.len().saturating_sub(last_good_end) as u64;
+        if bytes_quarantined > 0 {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .map_err(|error| StorageError::Io(error.to_string()))?;
+            file.set_len(last_good_end as u64)
+                .map_err(|error| StorageError::Io(error.to_string()))?;
+            file.sync_data()
+                .map_err(|error| StorageError::Io(error.to_string()))?;
+        }
+
+        Ok(WalRecoveryReport {
+            records_recovered,
+            last_good_sequence: (records_recovered > 0).then_some(records_recovered),
+            bytes_quarantined,
+            corruption_reason,
+        })
+    }
+
+    fn next_sequence(&self) -> Result<u64, StorageError> {
+        Ok(self.read_records()?.len() as u64 + 1)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalOptions {
+    pub fsync_policy: FsyncPolicy,
+}
+
+impl WalOptions {
+    pub fn new(fsync_policy: FsyncPolicy) -> Self {
+        Self { fsync_policy }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FsyncPolicy {
+    EveryWrite,
+    EveryNWrites(u64),
+    Never,
+}
+
+impl FsyncPolicy {
+    fn should_sync(&self, sequence: u64) -> bool {
+        match self {
+            Self::EveryWrite => true,
+            Self::EveryNWrites(interval) => *interval > 0 && sequence % interval == 0,
+            Self::Never => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WalAppendMetadata {
+    pub idempotency_key: Option<String>,
+}
+
+impl WalAppendMetadata {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalRecord {
+    pub sequence: u64,
+    pub event_id: String,
+    pub transaction_time: TxTime,
+    pub idempotency_key: Option<String>,
+    pub checksum: String,
+    pub event: GraphEvent,
+}
+
+impl WalRecord {
+    fn new(sequence: u64, event: GraphEvent, idempotency_key: Option<String>) -> Self {
+        let event_id = event.event_id().as_str().to_owned();
+        let transaction_time = event.transaction_time();
+        let payload = encode_event(&event);
+        let checksum = checksum_hex(
+            wal_checksum_input(
+                sequence,
+                &event_id,
+                transaction_time,
+                idempotency_key.as_deref(),
+                &payload,
+            )
+            .as_bytes(),
+        );
+        Self {
+            sequence,
+            event_id,
+            transaction_time,
+            idempotency_key,
+            checksum,
+            event,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalRecoveryReport {
+    pub records_recovered: u64,
+    pub last_good_sequence: Option<u64>,
+    pub bytes_quarantined: u64,
+    pub corruption_reason: Option<String>,
 }
 
 pub struct SnapshotWriter;
@@ -316,8 +489,9 @@ impl SnapshotWriter {
         .map_err(|error| StorageError::Io(error.to_string()))?;
         file.write_all(b"\n")
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        for event in storage.events() {
-            file.write_all(encode_event_record(event).as_bytes())
+        for (index, event) in storage.events().iter().enumerate() {
+            let record = WalRecord::new(index as u64 + 1, event.clone(), None);
+            file.write_all(encode_event_record(&record).as_bytes())
                 .map_err(|error| StorageError::Io(error.to_string()))?;
             file.write_all(b"\n")
                 .map_err(|error| StorageError::Io(error.to_string()))?;
@@ -325,51 +499,93 @@ impl SnapshotWriter {
         file.sync_data()
             .map_err(|error| StorageError::Io(error.to_string()))
     }
+
+    pub fn write_atomic(
+        path: impl AsRef<Path>,
+        storage: &InMemoryStorage,
+    ) -> Result<(), StorageError> {
+        let path = path.as_ref();
+        let temp_path = path.with_extension("tmp");
+        Self::write(&temp_path, storage)?;
+        fs::rename(&temp_path, path).map_err(|error| StorageError::Io(error.to_string()))?;
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_data();
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct SnapshotReader;
 
 impl SnapshotReader {
+    pub fn manifest(path: impl AsRef<Path>) -> Result<SnapshotManifest, StorageError> {
+        read_snapshot(path).map(|(manifest, _)| manifest)
+    }
+
     pub fn read(path: impl AsRef<Path>) -> Result<InMemoryStorage, StorageError> {
-        let file = File::open(path).map_err(|error| StorageError::Io(error.to_string()))?;
-        let mut lines = BufReader::new(file).lines();
-        let header = lines
-            .next()
-            .ok_or_else(|| StorageError::Codec("snapshot is empty".to_owned()))?
-            .map_err(|error| StorageError::Io(error.to_string()))?;
-        if header == LEGACY_SNAPSHOT_HEADER {
-            let mut events = Vec::new();
-            for line in lines {
-                let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                events.push(decode_event_record(&line)?);
-            }
-            return InMemoryStorage::replay(&events);
+        let (manifest, events) = read_snapshot(path)?;
+        let storage = InMemoryStorage::replay(&events)?;
+        let actual = SnapshotManifest::from_storage(&storage);
+        if !snapshot_manifests_match(&actual, &manifest) {
+            return Err(StorageError::SnapshotMismatch);
         }
-        if header != SNAPSHOT_HEADER {
-            return Err(StorageError::Codec("invalid snapshot header".to_owned()));
-        }
-        let manifest_line = lines
-            .next()
-            .ok_or_else(|| StorageError::Codec("snapshot manifest is missing".to_owned()))?
-            .map_err(|error| StorageError::Io(error.to_string()))?;
-        let manifest = decode_snapshot_manifest(&manifest_line)?;
+        Ok(storage)
+    }
+}
+
+fn read_snapshot(
+    path: impl AsRef<Path>,
+) -> Result<(SnapshotManifest, Vec<GraphEvent>), StorageError> {
+    let file = File::open(path).map_err(|error| StorageError::Io(error.to_string()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| StorageError::Codec("snapshot is empty".to_owned()))?
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+    if header == LEGACY_SNAPSHOT_HEADER {
         let mut events = Vec::new();
         for line in lines {
             let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            events.push(decode_event_record(&line)?);
+            events.push(decode_event_record(&line, events.len() as u64 + 1)?.event);
         }
         let storage = InMemoryStorage::replay(&events)?;
-        if SnapshotManifest::from_storage(&storage) != manifest {
-            return Err(StorageError::SnapshotMismatch);
-        }
-        Ok(storage)
+        return Ok((SnapshotManifest::from_storage(&storage), events));
     }
+    if header != SNAPSHOT_HEADER {
+        return Err(StorageError::Codec("invalid snapshot header".to_owned()));
+    }
+    let manifest_line = lines
+        .next()
+        .ok_or_else(|| StorageError::Codec("snapshot manifest is missing".to_owned()))?
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+    let manifest = decode_snapshot_manifest(&manifest_line)?;
+    let mut events = Vec::new();
+    for line in lines {
+        let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(decode_event_record(&line, events.len() as u64 + 1)?.event);
+    }
+    Ok((manifest, events))
+}
+
+fn snapshot_manifests_match(actual: &SnapshotManifest, expected: &SnapshotManifest) -> bool {
+    actual.schema_version == expected.schema_version
+        && actual.event_count == expected.event_count
+        && actual.last_event_id == expected.last_event_id
+        && actual.event_checksum == expected.event_checksum
+        && match expected.wal_lsn_boundary {
+            Some(boundary) => actual.wal_lsn_boundary == Some(boundary),
+            None => true,
+        }
+        && (expected.graph_state_hash.is_empty()
+            || actual.graph_state_hash == expected.graph_state_hash)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,6 +594,8 @@ pub struct SnapshotManifest {
     pub event_count: usize,
     pub last_event_id: Option<String>,
     pub event_checksum: String,
+    pub wal_lsn_boundary: Option<u64>,
+    pub graph_state_hash: String,
 }
 
 impl SnapshotManifest {
@@ -390,6 +608,8 @@ impl SnapshotManifest {
                 .last()
                 .map(|event| event.event_id().as_str().to_owned()),
             event_checksum: checksum_events(storage.events()),
+            wal_lsn_boundary: Some(storage.events().len() as u64),
+            graph_state_hash: deterministic_state_hash(storage),
         }
     }
 }
@@ -401,6 +621,8 @@ pub struct BackupManifest {
     pub assertion_count: usize,
     pub source_count: usize,
     pub last_event_id: Option<String>,
+    pub event_checksum: String,
+    pub graph_state_hash: String,
 }
 
 impl BackupManifest {
@@ -414,8 +636,18 @@ impl BackupManifest {
                 .events()
                 .last()
                 .map(|event| event.event_id().as_str().to_owned()),
+            event_checksum: checksum_events(storage.events()),
+            graph_state_hash: deterministic_state_hash(storage),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreReport {
+    pub manifest: BackupManifest,
+    pub restored_state_hash: String,
+    pub event_checksum: String,
+    pub query_parity_checked: bool,
 }
 
 pub struct BackupWriter;
@@ -433,8 +665,9 @@ impl BackupWriter {
             .map_err(|error| StorageError::Io(error.to_string()))?;
         file.write_all(b"\n")
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        for event in storage.events() {
-            file.write_all(encode_event_record(event).as_bytes())
+        for (index, event) in storage.events().iter().enumerate() {
+            let record = WalRecord::new(index as u64 + 1, event.clone(), None);
+            file.write_all(encode_event_record(&record).as_bytes())
                 .map_err(|error| StorageError::Io(error.to_string()))?;
             file.write_all(b"\n")
                 .map_err(|error| StorageError::Io(error.to_string()))?;
@@ -455,11 +688,55 @@ impl BackupReader {
     pub fn restore(path: impl AsRef<Path>) -> Result<InMemoryStorage, StorageError> {
         let (manifest, events) = read_backup(path)?;
         let storage = InMemoryStorage::replay(&events)?;
-        if BackupManifest::from_storage(&storage) != manifest {
+        if !backup_manifests_match(&BackupManifest::from_storage(&storage), &manifest) {
             return Err(StorageError::SnapshotMismatch);
         }
         Ok(storage)
     }
+
+    pub fn restore_report(path: impl AsRef<Path>) -> Result<RestoreReport, StorageError> {
+        let (manifest, events) = read_backup(path)?;
+        let storage = InMemoryStorage::replay(&events)?;
+        let actual = BackupManifest::from_storage(&storage);
+        if !backup_manifests_match(&actual, &manifest) {
+            return Err(StorageError::SnapshotMismatch);
+        }
+        Ok(RestoreReport {
+            manifest: actual,
+            restored_state_hash: deterministic_state_hash(&storage),
+            event_checksum: checksum_events(storage.events()),
+            query_parity_checked: backup_query_parity(&storage),
+        })
+    }
+}
+
+fn backup_manifests_match(actual: &BackupManifest, expected: &BackupManifest) -> bool {
+    actual.event_count == expected.event_count
+        && actual.entity_count == expected.entity_count
+        && actual.assertion_count == expected.assertion_count
+        && actual.source_count == expected.source_count
+        && actual.last_event_id == expected.last_event_id
+        && (expected.event_checksum.is_empty() || actual.event_checksum == expected.event_checksum)
+        && (expected.graph_state_hash.is_empty()
+            || actual.graph_state_hash == expected.graph_state_hash)
+}
+
+fn backup_query_parity(storage: &InMemoryStorage) -> bool {
+    storage
+        .graph_state()
+        .assertions
+        .values()
+        .all(|assertion| storage.assertion(&assertion.id).is_some())
+        && storage
+            .graph_state()
+            .entities
+            .values()
+            .all(|entity| storage.entity(&entity.id).is_some())
+        && storage
+            .graph_state()
+            .sources
+            .values()
+            .all(|source| storage.source(&source.id).is_some())
 }
 
 fn read_backup(path: impl AsRef<Path>) -> Result<(BackupManifest, Vec<GraphEvent>), StorageError> {
@@ -483,7 +760,7 @@ fn read_backup(path: impl AsRef<Path>) -> Result<(BackupManifest, Vec<GraphEvent
         if line.trim().is_empty() {
             continue;
         }
-        events.push(decode_event_record(&line)?);
+        events.push(decode_event_record(&line, events.len() as u64 + 1)?.event);
     }
     Ok((manifest, events))
 }
@@ -495,6 +772,8 @@ fn encode_backup_manifest(manifest: &BackupManifest) -> String {
         manifest.assertion_count.to_string(),
         manifest.source_count.to_string(),
         manifest.last_event_id.clone().unwrap_or_default(),
+        manifest.event_checksum.clone(),
+        manifest.graph_state_hash.clone(),
     ])
 }
 
@@ -509,6 +788,13 @@ fn encode_snapshot_manifest(manifest: &SnapshotManifest) -> String {
         manifest.last_event_id.clone().unwrap_or_default(),
         "event_checksum".to_owned(),
         manifest.event_checksum.clone(),
+        "wal_lsn_boundary".to_owned(),
+        manifest
+            .wal_lsn_boundary
+            .map(|sequence| sequence.to_string())
+            .unwrap_or_default(),
+        "graph_state_hash".to_owned(),
+        manifest.graph_state_hash.clone(),
     ])
 }
 
@@ -532,11 +818,33 @@ fn decode_snapshot_manifest(record: &str) -> Result<SnapshotManifest, StorageErr
         "" => None,
         value => Some(value.to_owned()),
     };
+    let wal_lsn_boundary = if parts.len() > 10 {
+        if required(&parts, 9, "wal lsn boundary key")? != "wal_lsn_boundary"
+            || required(&parts, 11, "graph state hash key")? != "graph_state_hash"
+        {
+            return Err(StorageError::Codec(
+                "invalid snapshot manifest fields".to_owned(),
+            ));
+        }
+        match required(&parts, 10, "wal lsn boundary")? {
+            "" => None,
+            value => Some(parse_u64(value)?),
+        }
+    } else {
+        None
+    };
+    let graph_state_hash = if parts.len() > 12 {
+        required(&parts, 12, "graph state hash")?.to_owned()
+    } else {
+        String::new()
+    };
     Ok(SnapshotManifest {
         schema_version: parse_u32(required(&parts, 2, "schema version")?)?,
         event_count: parse_usize(required(&parts, 4, "event count")?)?,
         last_event_id,
         event_checksum: required(&parts, 8, "event checksum")?.to_owned(),
+        wal_lsn_boundary,
+        graph_state_hash,
     })
 }
 
@@ -552,41 +860,130 @@ fn decode_backup_manifest(record: &str) -> Result<BackupManifest, StorageError> 
         assertion_count: parse_usize(required(&parts, 2, "assertion count")?)?,
         source_count: parse_usize(required(&parts, 3, "source count")?)?,
         last_event_id,
+        event_checksum: parts.get(5).cloned().unwrap_or_default(),
+        graph_state_hash: parts.get(6).cloned().unwrap_or_default(),
     })
 }
 
-fn encode_event_record(event: &GraphEvent) -> String {
-    let payload = encode_event(event);
+fn encode_event_record(record: &WalRecord) -> String {
+    let payload = encode_event(&record.event);
     encode_parts(&[
         EVENT_RECORD_KIND.to_owned(),
+        record.sequence.to_string(),
+        record.checksum.clone(),
         EVENT_RECORD_VERSION.to_owned(),
-        checksum_hex(payload.as_bytes()),
+        record.event_id.clone(),
+        record.transaction_time.as_i64().to_string(),
+        record.idempotency_key.clone().unwrap_or_default(),
         payload,
     ])
 }
 
-fn decode_event_record(record: &str) -> Result<GraphEvent, StorageError> {
+fn decode_event_record(record: &str, expected_sequence: u64) -> Result<WalRecord, StorageError> {
     let parts = decode_parts(record)?;
     if parts
         .first()
         .is_some_and(|kind| kind.as_str() == EVENT_RECORD_KIND)
     {
-        if required(&parts, 1, "event record version")? != EVENT_RECORD_VERSION {
+        if parts.len() == 4
+            && required(&parts, 1, "event record version")? == LEGACY_EVENT_RECORD_VERSION
+        {
+            let checksum = required(&parts, 2, "event checksum")?;
+            let payload = required(&parts, 3, "event payload")?;
+            let actual = checksum_hex(payload.as_bytes());
+            if checksum != actual {
+                return Err(StorageError::Codec(format!(
+                    "event checksum mismatch: expected {checksum}, got {actual}"
+                )));
+            }
+            let event = decode_event(payload)?;
+            return Ok(WalRecord {
+                sequence: expected_sequence,
+                event_id: event.event_id().as_str().to_owned(),
+                transaction_time: event.transaction_time(),
+                idempotency_key: None,
+                checksum: checksum.to_owned(),
+                event,
+            });
+        }
+        let sequence = parse_u64(required(&parts, 1, "event sequence")?)?;
+        if sequence != expected_sequence {
+            return Err(StorageError::Codec(format!(
+                "event sequence mismatch: expected {expected_sequence}, got {sequence}"
+            )));
+        }
+        let checksum = required(&parts, 2, "event checksum")?;
+        if required(&parts, 3, "event record version")? != EVENT_RECORD_VERSION {
             return Err(StorageError::Codec(
                 "unsupported event record version".to_owned(),
             ));
         }
-        let checksum = required(&parts, 2, "event checksum")?;
-        let payload = required(&parts, 3, "event payload")?;
-        let actual = checksum_hex(payload.as_bytes());
+        let event_id = required(&parts, 4, "event id")?.to_owned();
+        let transaction_time = TxTime::new(parse_i64(required(&parts, 5, "transaction time")?)?);
+        let idempotency_key = match required(&parts, 6, "idempotency key")? {
+            "" => None,
+            value => Some(value.to_owned()),
+        };
+        let payload = required(&parts, 7, "event payload")?;
+        let actual = checksum_hex(
+            wal_checksum_input(
+                sequence,
+                &event_id,
+                transaction_time,
+                idempotency_key.as_deref(),
+                payload,
+            )
+            .as_bytes(),
+        );
         if checksum != actual {
             return Err(StorageError::Codec(format!(
                 "event checksum mismatch: expected {checksum}, got {actual}"
             )));
         }
-        return decode_event(payload);
+        let event = decode_event(payload)?;
+        if event.event_id().as_str() != event_id {
+            return Err(StorageError::Codec("event id metadata mismatch".to_owned()));
+        }
+        if event.transaction_time() != transaction_time {
+            return Err(StorageError::Codec(
+                "transaction time metadata mismatch".to_owned(),
+            ));
+        }
+        return Ok(WalRecord {
+            sequence,
+            event_id,
+            transaction_time,
+            idempotency_key,
+            checksum: checksum.to_owned(),
+            event,
+        });
     }
-    decode_event(record)
+    let event = decode_event(record)?;
+    Ok(WalRecord {
+        sequence: expected_sequence,
+        event_id: event.event_id().as_str().to_owned(),
+        transaction_time: event.transaction_time(),
+        idempotency_key: None,
+        checksum: checksum_hex(record.as_bytes()),
+        event,
+    })
+}
+
+fn wal_checksum_input(
+    sequence: u64,
+    event_id: &str,
+    transaction_time: TxTime,
+    idempotency_key: Option<&str>,
+    payload: &str,
+) -> String {
+    encode_parts(&[
+        sequence.to_string(),
+        EVENT_RECORD_VERSION.to_owned(),
+        event_id.to_owned(),
+        transaction_time.as_i64().to_string(),
+        idempotency_key.unwrap_or_default().to_owned(),
+        payload.to_owned(),
+    ])
 }
 
 fn checksum_events(events: &[GraphEvent]) -> String {
@@ -596,6 +993,21 @@ fn checksum_events(events: &[GraphEvent]) -> String {
         bytes.push(b'\n');
     }
     checksum_hex(&bytes)
+}
+
+pub fn deterministic_state_hash(storage: &InMemoryStorage) -> String {
+    checksum_hex(
+        format!(
+            "events={};entities={};assertions={};sources={};memories={};checksum={}",
+            storage.events().len(),
+            storage.graph_state().entities.len(),
+            storage.graph_state().assertions.len(),
+            storage.graph_state().sources.len(),
+            storage.graph_state().agent_memories.len(),
+            checksum_events(storage.events())
+        )
+        .as_bytes(),
+    )
 }
 
 fn checksum_hex(bytes: &[u8]) -> String {
@@ -1481,18 +1893,143 @@ mod tests {
     }
 
     #[test]
+    fn wal_records_include_sequence_transaction_time_idempotency_and_checksum() {
+        let path = temp_file("wal-metadata");
+        let events = sample_events();
+        {
+            let mut file_log =
+                FileEventLog::open_with_options(&path, WalOptions::new(FsyncPolicy::EveryWrite))
+                    .expect("open log");
+            file_log
+                .append_with_metadata(
+                    &events[0],
+                    WalAppendMetadata::new().with_idempotency_key("source-1-once"),
+                )
+                .expect("append source");
+            file_log
+                .append_with_metadata(&events[1], WalAppendMetadata::new())
+                .expect("append entity");
+        }
+
+        let reloaded = FileEventLog::open(&path).expect("reopen log");
+        let records = reloaded.read_records().expect("read records");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, 1);
+        assert_eq!(records[1].sequence, 2);
+        assert_eq!(records[0].event_id, events[0].event_id().as_str());
+        assert_eq!(records[0].transaction_time, events[0].transaction_time());
+        assert_eq!(records[0].idempotency_key.as_deref(), Some("source-1-once"));
+        assert_eq!(records[0].event, events[0]);
+        assert_eq!(records[1].idempotency_key, None);
+        assert!(!records[0].checksum.is_empty());
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn wal_recovery_truncates_partial_tail_and_reports_quarantined_bytes() {
+        let path = temp_file("wal-truncate-tail");
+        let events = sample_events();
+        {
+            let mut file_log = FileEventLog::open(&path).expect("open log");
+            file_log.append(&events[0]).expect("append source");
+            file_log.append(&events[1]).expect("append entity");
+        }
+        let original_len = fs::metadata(&path).expect("metadata").len();
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open append");
+            file.write_all(b"RGEVENT|3|partial")
+                .expect("write torn record");
+            file.sync_data().expect("sync torn record");
+        }
+
+        let mut file_log = FileEventLog::open(&path).expect("reopen log");
+        assert!(file_log.read_all().is_err());
+
+        let report = file_log
+            .recover_truncate_to_last_good()
+            .expect("recover last good");
+        assert_eq!(report.records_recovered, 2);
+        assert_eq!(report.last_good_sequence, Some(2));
+        assert!(report.bytes_quarantined > 0);
+        assert_eq!(fs::metadata(&path).expect("metadata").len(), original_len);
+        assert_eq!(
+            file_log.read_all().expect("read after recovery"),
+            events[..2]
+        );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn wal_rejects_out_of_order_sequence_numbers() {
+        let path = temp_file("wal-out-of-order");
+        let events = sample_events();
+        {
+            let mut file_log = FileEventLog::open(&path).expect("open log");
+            file_log.append(&events[0]).expect("append source");
+            file_log.append(&events[1]).expect("append entity");
+        }
+        let contents = fs::read_to_string(&path).expect("read log");
+        let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut second_record = decode_parts(&lines[1]).expect("decode record parts");
+        second_record[1] = "4".to_owned();
+        lines[1] = encode_parts(&second_record);
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write out of order log");
+
+        let reloaded = FileEventLog::open(&path).expect("reopen log");
+        assert!(matches!(
+            reloaded.read_all(),
+            Err(StorageError::Codec(message)) if message.contains("sequence")
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn snapshots_include_manifest_and_detect_corruption() {
         let path = temp_file("snapshot-manifest");
         let events = sample_events();
         let storage = InMemoryStorage::replay(&events).expect("replay succeeds");
 
         SnapshotWriter::write(&path, &storage).expect("write snapshot");
+        let manifest = SnapshotReader::manifest(&path).expect("read manifest");
+        assert_eq!(manifest.wal_lsn_boundary, Some(events.len() as u64));
+        assert_eq!(
+            manifest.graph_state_hash,
+            deterministic_state_hash(&storage)
+        );
+
         let mut contents = fs::read_to_string(&path).expect("read snapshot");
         contents = contents.replacen("event_count", "event_count_corrupt", 1);
         fs::write(&path, contents).expect("corrupt snapshot");
 
         let result = SnapshotReader::read(&path);
         assert!(result.is_err());
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshot_atomic_publish_never_leaves_missing_manifest() {
+        let path = temp_file("snapshot-atomic");
+        let events = sample_events();
+        let storage = InMemoryStorage::replay(&events).expect("replay succeeds");
+
+        SnapshotWriter::write_atomic(&path, &storage).expect("write atomic snapshot");
+        let manifest = SnapshotReader::manifest(&path).expect("manifest");
+        let restored = SnapshotReader::read(&path).expect("read snapshot");
+
+        assert_eq!(
+            manifest.graph_state_hash,
+            deterministic_state_hash(&restored)
+        );
+        assert_eq!(restored.events(), storage.events());
+        assert!(!path.with_extension("tmp").exists());
 
         fs::remove_file(path).expect("cleanup");
     }
@@ -1521,8 +2058,16 @@ mod tests {
         let manifest = BackupWriter::write(&path, &storage).expect("write backup");
         let restored = BackupReader::restore(&path).expect("restore backup");
         let restored_manifest = BackupReader::manifest(&path).expect("read backup manifest");
+        let report = BackupReader::restore_report(&path).expect("restore report");
 
         assert_eq!(manifest, restored_manifest);
+        assert_eq!(report.manifest, manifest);
+        assert_eq!(
+            report.restored_state_hash,
+            deterministic_state_hash(&storage)
+        );
+        assert_eq!(report.event_checksum, checksum_events(storage.events()));
+        assert!(report.query_parity_checked);
         assert_eq!(manifest.event_count, events.len());
         assert_eq!(manifest.entity_count, 2);
         assert_eq!(manifest.assertion_count, 1);

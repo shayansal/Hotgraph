@@ -1,0 +1,76 @@
+name: Production Readiness Nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+    - cron: "47 4 * * 0"
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  storage-recovery-matrix:
+    name: Storage recovery matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run WAL, snapshot, and restore tests
+        run: cargo test -p rg-storage --locked -- --nocapture
+
+      - name: Run API durable-state tests
+        run: cargo test -p rg-api --test http_api --locked -- --nocapture
+
+  benchmark-smoke:
+    name: Benchmark smoke artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run benchmark smoke
+        env:
+          RG_BENCH_SCALE: smoke
+        run: cargo bench -p rg-bench --bench reality_graph --locked -- --sample-size 10 --measurement-time 1
+
+      - name: Upload criterion artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-smoke-${{ github.run_id }}
+          path: target/criterion
+          if-no-files-found: ignore
+
+  weekly-standard-benchmark:
+    name: Weekly standard benchmark artifact
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '47 4 * * 0'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run standard benchmark
+        env:
+          RG_BENCH_SCALE: standard
+        run: cargo bench -p rg-bench --bench reality_graph --locked -- --sample-size 10 --measurement-time 1
+
+      - name: Upload standard criterion artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-standard-${{ github.run_id }}
+          path: target/criterion
+          if-no-files-found: error

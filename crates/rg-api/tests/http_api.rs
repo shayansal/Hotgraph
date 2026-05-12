@@ -7,6 +7,7 @@ use rg_api::{
     DeterministicContextPackModelProvider, DeterministicQuestionEmbeddingProvider,
     QuestionEmbeddingProvider, ServiceAccount,
 };
+use rg_storage::FileEventLog;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -341,6 +342,15 @@ async fn durable_api_state_recovers_events_and_idempotency_after_restart() {
         )
         .await;
     }
+
+    let records = FileEventLog::open(&event_log_path)
+        .expect("open wal")
+        .read_records()
+        .expect("read wal records");
+    assert_eq!(
+        records[0].idempotency_key.as_deref(),
+        Some("source-restart-once")
+    );
 
     let restarted = router(
         ApiState::from_durable_event_log(&event_log_path)

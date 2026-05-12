@@ -29,7 +29,7 @@ use rg_ingest::{
 use rg_query::{
     EntityPattern, GraphQuery, ObjectPattern, PathQuery, PredicatePattern, QueryEngine, QueryResult,
 };
-use rg_storage::{FileEventLog, InMemoryStorage, StorageError};
+use rg_storage::{FileEventLog, InMemoryStorage, StorageError, WalAppendMetadata};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
@@ -238,10 +238,14 @@ impl ApiState {
         let mut candidate = log.clone();
         let event = candidate.execute(command).map_err(ApiError::from)?;
         if let Some(durable_log) = &self.durable_log {
+            let metadata = idempotency_key
+                .as_deref()
+                .map(|key| WalAppendMetadata::new().with_idempotency_key(key))
+                .unwrap_or_default();
             durable_log
                 .lock()
                 .map_err(|_| ApiError::internal("durable event log lock poisoned"))?
-                .append(&event)
+                .append_with_metadata(&event, metadata)
                 .map_err(ApiError::from)?;
         }
         self.storage
