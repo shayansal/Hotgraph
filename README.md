@@ -325,4 +325,6 @@ Architecture decisions:
 
 ## License
 
-This workspace is configured as `MIT OR Apache-2.0` in `Cargo.toml`.
+This workspace is open source under `MIT OR Apache-2.0`.
+
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
