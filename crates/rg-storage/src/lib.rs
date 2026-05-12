@@ -23,6 +23,11 @@ pub enum StorageError {
     SnapshotMismatch,
 }
 
+const EVENT_RECORD_KIND: &str = "RGEVENT";
+const EVENT_RECORD_VERSION: &str = "1";
+const SNAPSHOT_HEADER: &str = "RGSTORAGE-SNAPSHOT-V2";
+const LEGACY_SNAPSHOT_HEADER: &str = "RGSTORAGE-SNAPSHOT-V1";
+
 pub trait GraphStore {
     fn append(&mut self, event: GraphEvent) -> Result<(), StorageError>;
     fn events(&self) -> &[GraphEvent];
@@ -52,9 +57,11 @@ impl InMemoryStorage {
     }
 
     pub fn append_event(&mut self, event: GraphEvent) -> Result<(), StorageError> {
-        let mut events = self.events.clone();
-        events.push(event);
-        *self = Self::replay(&events)?;
+        self.state
+            .apply_event(&event)
+            .map_err(StorageError::Replay)?;
+        self.indexes.apply_event(&event, &self.state);
+        self.events.push(event);
         Ok(())
     }
 
@@ -152,52 +159,64 @@ impl StorageIndexes {
     fn from_state(state: &GraphState) -> Self {
         let mut indexes = Self::default();
         for assertion in state.assertions.values() {
-            push_index(
-                &mut indexes.by_subject,
-                assertion.subject.clone(),
-                assertion.id.clone(),
-            );
-            push_index(
-                &mut indexes.by_predicate,
-                assertion.predicate.clone(),
-                assertion.id.clone(),
-            );
-            push_index(
-                &mut indexes.by_object,
-                ObjectIndexKey::from(&assertion.object),
-                assertion.id.clone(),
-            );
-            push_index(
-                &mut indexes.by_entity,
-                assertion.subject.clone(),
-                assertion.id.clone(),
-            );
-            if let GraphValue::Entity(entity_id) = &assertion.object {
-                push_index(
-                    &mut indexes.by_entity,
-                    entity_id.clone(),
-                    assertion.id.clone(),
-                );
-            }
-            push_index(
-                &mut indexes.by_valid_time,
-                assertion.valid_time.start.as_i64(),
-                assertion.id.clone(),
-            );
-            push_index(
-                &mut indexes.by_tx_time,
-                assertion.transaction_time.start.as_i64(),
-                assertion.id.clone(),
-            );
-            for source_id in &assertion.source_ids {
-                push_index(
-                    &mut indexes.by_source,
-                    source_id.clone(),
-                    assertion.id.clone(),
-                );
-            }
+            indexes.index_assertion(assertion);
         }
         indexes
+    }
+
+    fn apply_event(&mut self, event: &GraphEvent, state: &GraphState) {
+        match event {
+            GraphEvent::AssertionAdded(event) => self.index_assertion(&event.assertion),
+            GraphEvent::EvidenceLinked(event)
+                if state.assertions.contains_key(&event.assertion_id) =>
+            {
+                push_index(
+                    &mut self.by_source,
+                    event.source_id.clone(),
+                    event.assertion_id.clone(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn index_assertion(&mut self, assertion: &Assertion) {
+        push_index(
+            &mut self.by_subject,
+            assertion.subject.clone(),
+            assertion.id.clone(),
+        );
+        push_index(
+            &mut self.by_predicate,
+            assertion.predicate.clone(),
+            assertion.id.clone(),
+        );
+        push_index(
+            &mut self.by_object,
+            ObjectIndexKey::from(&assertion.object),
+            assertion.id.clone(),
+        );
+        push_index(
+            &mut self.by_entity,
+            assertion.subject.clone(),
+            assertion.id.clone(),
+        );
+        if let GraphValue::Entity(entity_id) = &assertion.object {
+            push_index(&mut self.by_entity, entity_id.clone(), assertion.id.clone());
+        }
+        push_index(
+            &mut self.by_valid_time,
+            assertion.valid_time.start.as_i64(),
+            assertion.id.clone(),
+        );
+        push_index(
+            &mut self.by_tx_time,
+            assertion.transaction_time.start.as_i64(),
+            assertion.id.clone(),
+        );
+        for source_id in &assertion.source_ids {
+            push_index(&mut self.by_source, source_id.clone(), assertion.id.clone());
+        }
     }
 }
 
@@ -258,7 +277,7 @@ impl FileEventLog {
             .append(true)
             .open(&self.path)
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        file.write_all(encode_event(event).as_bytes())
+        file.write_all(encode_event_record(event).as_bytes())
             .map_err(|error| StorageError::Io(error.to_string()))?;
         file.write_all(b"\n")
             .map_err(|error| StorageError::Io(error.to_string()))?;
@@ -276,7 +295,7 @@ impl FileEventLog {
             if line.trim().is_empty() {
                 continue;
             }
-            events.push(decode_event(&line)?);
+            events.push(decode_event_record(&line)?);
         }
         Ok(events)
     }
@@ -287,10 +306,18 @@ pub struct SnapshotWriter;
 impl SnapshotWriter {
     pub fn write(path: impl AsRef<Path>, storage: &InMemoryStorage) -> Result<(), StorageError> {
         let mut file = File::create(path).map_err(|error| StorageError::Io(error.to_string()))?;
-        file.write_all(b"RGSTORAGE-SNAPSHOT-V1\n")
+        file.write_all(SNAPSHOT_HEADER.as_bytes())
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        file.write_all(b"\n")
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        file.write_all(
+            encode_snapshot_manifest(&SnapshotManifest::from_storage(storage)).as_bytes(),
+        )
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+        file.write_all(b"\n")
             .map_err(|error| StorageError::Io(error.to_string()))?;
         for event in storage.events() {
-            file.write_all(encode_event(event).as_bytes())
+            file.write_all(encode_event_record(event).as_bytes())
                 .map_err(|error| StorageError::Io(error.to_string()))?;
             file.write_all(b"\n")
                 .map_err(|error| StorageError::Io(error.to_string()))?;
@@ -310,18 +337,60 @@ impl SnapshotReader {
             .next()
             .ok_or_else(|| StorageError::Codec("snapshot is empty".to_owned()))?
             .map_err(|error| StorageError::Io(error.to_string()))?;
-        if header != "RGSTORAGE-SNAPSHOT-V1" {
+        if header == LEGACY_SNAPSHOT_HEADER {
+            let mut events = Vec::new();
+            for line in lines {
+                let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                events.push(decode_event_record(&line)?);
+            }
+            return InMemoryStorage::replay(&events);
+        }
+        if header != SNAPSHOT_HEADER {
             return Err(StorageError::Codec("invalid snapshot header".to_owned()));
         }
+        let manifest_line = lines
+            .next()
+            .ok_or_else(|| StorageError::Codec("snapshot manifest is missing".to_owned()))?
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        let manifest = decode_snapshot_manifest(&manifest_line)?;
         let mut events = Vec::new();
         for line in lines {
             let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            events.push(decode_event(&line)?);
+            events.push(decode_event_record(&line)?);
         }
-        InMemoryStorage::replay(&events)
+        let storage = InMemoryStorage::replay(&events)?;
+        if SnapshotManifest::from_storage(&storage) != manifest {
+            return Err(StorageError::SnapshotMismatch);
+        }
+        Ok(storage)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotManifest {
+    pub schema_version: u32,
+    pub event_count: usize,
+    pub last_event_id: Option<String>,
+    pub event_checksum: String,
+}
+
+impl SnapshotManifest {
+    fn from_storage(storage: &InMemoryStorage) -> Self {
+        Self {
+            schema_version: 2,
+            event_count: storage.events().len(),
+            last_event_id: storage
+                .events()
+                .last()
+                .map(|event| event.event_id().as_str().to_owned()),
+            event_checksum: checksum_events(storage.events()),
+        }
     }
 }
 
@@ -365,7 +434,7 @@ impl BackupWriter {
         file.write_all(b"\n")
             .map_err(|error| StorageError::Io(error.to_string()))?;
         for event in storage.events() {
-            file.write_all(encode_event(event).as_bytes())
+            file.write_all(encode_event_record(event).as_bytes())
                 .map_err(|error| StorageError::Io(error.to_string()))?;
             file.write_all(b"\n")
                 .map_err(|error| StorageError::Io(error.to_string()))?;
@@ -414,7 +483,7 @@ fn read_backup(path: impl AsRef<Path>) -> Result<(BackupManifest, Vec<GraphEvent
         if line.trim().is_empty() {
             continue;
         }
-        events.push(decode_event(&line)?);
+        events.push(decode_event_record(&line)?);
     }
     Ok((manifest, events))
 }
@@ -427,6 +496,48 @@ fn encode_backup_manifest(manifest: &BackupManifest) -> String {
         manifest.source_count.to_string(),
         manifest.last_event_id.clone().unwrap_or_default(),
     ])
+}
+
+fn encode_snapshot_manifest(manifest: &SnapshotManifest) -> String {
+    encode_parts(&[
+        "snapshot_manifest".to_owned(),
+        "schema_version".to_owned(),
+        manifest.schema_version.to_string(),
+        "event_count".to_owned(),
+        manifest.event_count.to_string(),
+        "last_event_id".to_owned(),
+        manifest.last_event_id.clone().unwrap_or_default(),
+        "event_checksum".to_owned(),
+        manifest.event_checksum.clone(),
+    ])
+}
+
+fn decode_snapshot_manifest(record: &str) -> Result<SnapshotManifest, StorageError> {
+    let parts = decode_parts(record)?;
+    if required(&parts, 0, "snapshot manifest kind")? != "snapshot_manifest" {
+        return Err(StorageError::Codec(
+            "invalid snapshot manifest kind".to_owned(),
+        ));
+    }
+    if required(&parts, 1, "schema version key")? != "schema_version"
+        || required(&parts, 3, "event count key")? != "event_count"
+        || required(&parts, 5, "last event id key")? != "last_event_id"
+        || required(&parts, 7, "event checksum key")? != "event_checksum"
+    {
+        return Err(StorageError::Codec(
+            "invalid snapshot manifest fields".to_owned(),
+        ));
+    }
+    let last_event_id = match required(&parts, 6, "last event id")? {
+        "" => None,
+        value => Some(value.to_owned()),
+    };
+    Ok(SnapshotManifest {
+        schema_version: parse_u32(required(&parts, 2, "schema version")?)?,
+        event_count: parse_usize(required(&parts, 4, "event count")?)?,
+        last_event_id,
+        event_checksum: required(&parts, 8, "event checksum")?.to_owned(),
+    })
 }
 
 fn decode_backup_manifest(record: &str) -> Result<BackupManifest, StorageError> {
@@ -442,6 +553,58 @@ fn decode_backup_manifest(record: &str) -> Result<BackupManifest, StorageError> 
         source_count: parse_usize(required(&parts, 3, "source count")?)?,
         last_event_id,
     })
+}
+
+fn encode_event_record(event: &GraphEvent) -> String {
+    let payload = encode_event(event);
+    encode_parts(&[
+        EVENT_RECORD_KIND.to_owned(),
+        EVENT_RECORD_VERSION.to_owned(),
+        checksum_hex(payload.as_bytes()),
+        payload,
+    ])
+}
+
+fn decode_event_record(record: &str) -> Result<GraphEvent, StorageError> {
+    let parts = decode_parts(record)?;
+    if parts
+        .first()
+        .is_some_and(|kind| kind.as_str() == EVENT_RECORD_KIND)
+    {
+        if required(&parts, 1, "event record version")? != EVENT_RECORD_VERSION {
+            return Err(StorageError::Codec(
+                "unsupported event record version".to_owned(),
+            ));
+        }
+        let checksum = required(&parts, 2, "event checksum")?;
+        let payload = required(&parts, 3, "event payload")?;
+        let actual = checksum_hex(payload.as_bytes());
+        if checksum != actual {
+            return Err(StorageError::Codec(format!(
+                "event checksum mismatch: expected {checksum}, got {actual}"
+            )));
+        }
+        return decode_event(payload);
+    }
+    decode_event(record)
+}
+
+fn checksum_events(events: &[GraphEvent]) -> String {
+    let mut bytes = Vec::new();
+    for event in events {
+        bytes.extend_from_slice(encode_event(event).as_bytes());
+        bytes.push(b'\n');
+    }
+    checksum_hex(&bytes)
+}
+
+fn checksum_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn encode_event(event: &GraphEvent) -> String {
@@ -1289,6 +1452,47 @@ mod tests {
             GraphState::replay(&recovered_events).expect("graph replay"),
             GraphState::replay(&events).expect("expected replay")
         );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn file_event_log_rejects_corrupted_event_records() {
+        let path = temp_file("event-log-corrupt");
+        let events = sample_events();
+        {
+            let mut file_log = FileEventLog::open(&path).expect("open log");
+            file_log.append(&events[0]).expect("append event");
+        }
+
+        let contents = fs::read_to_string(&path).expect("read log");
+        let mut parts = decode_parts(contents.trim_end()).expect("event record parts");
+        assert_eq!(parts[0], EVENT_RECORD_KIND);
+        parts[2] = "0000000000000000".to_owned();
+        fs::write(&path, format!("{}\n", encode_parts(&parts))).expect("corrupt log");
+
+        let reloaded = FileEventLog::open(&path).expect("reopen log");
+        assert!(matches!(
+            reloaded.read_all(),
+            Err(StorageError::Codec(message)) if message.contains("checksum")
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshots_include_manifest_and_detect_corruption() {
+        let path = temp_file("snapshot-manifest");
+        let events = sample_events();
+        let storage = InMemoryStorage::replay(&events).expect("replay succeeds");
+
+        SnapshotWriter::write(&path, &storage).expect("write snapshot");
+        let mut contents = fs::read_to_string(&path).expect("read snapshot");
+        contents = contents.replacen("event_count", "event_count_corrupt", 1);
+        fs::write(&path, contents).expect("corrupt snapshot");
+
+        let result = SnapshotReader::read(&path);
+        assert!(result.is_err());
 
         fs::remove_file(path).expect("cleanup");
     }

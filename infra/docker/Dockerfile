@@ -17,12 +17,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --system realitygraph \
-    && useradd --system --gid realitygraph --home-dir /nonexistent --shell /usr/sbin/nologin realitygraph
+RUN groupadd --system --gid 10001 realitygraph \
+    && useradd --system --uid 10001 --gid realitygraph --home-dir /nonexistent --shell /usr/sbin/nologin realitygraph \
+    && mkdir -p /var/lib/reality-graph \
+    && chown -R realitygraph:realitygraph /var/lib/reality-graph
 
 COPY --from=builder /workspace/target/release/rg-api /usr/local/bin/rg-api
 
 ENV RG_API_ADDR=0.0.0.0:8080
+ENV RG_EVENT_LOG_PATH=/var/lib/reality-graph/events.log
+ENV RG_IDEMPOTENCY_LOG_PATH=/var/lib/reality-graph/idempotency.log
 ENV RUST_LOG=info
 
 USER realitygraph

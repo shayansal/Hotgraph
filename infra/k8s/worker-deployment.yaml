@@ -24,11 +24,14 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: worker
-          image: reality-graph-api:latest
+          image: registry.example.com/reality-graph-api:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: health
@@ -41,6 +44,12 @@ spec:
               value: "0.0.0.0:8081"
             - name: RG_WORKER_ROLE
               value: ingestion
+            - name: RG_API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: reality-graph-secrets
+                  key: RG_API_KEYS
+                  optional: false
           readinessProbe:
             httpGet:
               path: /v1/health

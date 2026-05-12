@@ -1,12 +1,15 @@
 //! HTTP API boundary for exposing Reality Graph services.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header::CONTENT_TYPE, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,35 +29,134 @@ use rg_ingest::{
 use rg_query::{
     EntityPattern, GraphQuery, ObjectPattern, PathQuery, PredicatePattern, QueryEngine, QueryResult,
 };
-use rg_storage::{InMemoryStorage, StorageError};
+use rg_storage::{FileEventLog, InMemoryStorage, StorageError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-#[derive(Clone)]
+const DEFAULT_SLOW_QUERY_THRESHOLD: Duration = Duration::from_millis(100);
+const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+const DEFAULT_QUERY_LIMIT: usize = 100;
+const DEFAULT_MAX_QUERY_LIMIT: usize = 1000;
+const DEFAULT_MAX_PATH_DEPTH: usize = 8;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug)]
 pub struct ApiState {
     log: Arc<Mutex<EventLog>>,
+    storage: Arc<Mutex<InMemoryStorage>>,
+    durable_log: Option<Arc<Mutex<FileEventLog>>>,
     auth: Arc<AuthConfig>,
     idempotency: Arc<Mutex<BTreeMap<String, IdempotencyRecord>>>,
+    idempotency_path: Option<Arc<PathBuf>>,
     slow_query_threshold: Duration,
+    max_body_bytes: usize,
+    default_query_limit: usize,
+    max_query_limit: usize,
+    max_path_depth: usize,
+    request_timeout: Duration,
+    metrics: Arc<Mutex<ApiMetrics>>,
 }
 
 impl ApiState {
     pub fn new_in_memory() -> Self {
         Self {
             log: Arc::new(Mutex::new(EventLog::new(TxTime::new(0)))),
+            storage: Arc::new(Mutex::new(InMemoryStorage::new())),
+            durable_log: None,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
-            slow_query_threshold: Duration::from_millis(100),
+            idempotency_path: None,
+            slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            default_query_limit: DEFAULT_QUERY_LIMIT,
+            max_query_limit: DEFAULT_MAX_QUERY_LIMIT,
+            max_path_depth: DEFAULT_MAX_PATH_DEPTH,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            metrics: Arc::new(Mutex::new(ApiMetrics::default())),
         }
     }
 
     pub fn from_event_log(log: EventLog) -> Self {
+        let storage = InMemoryStorage::replay(log.events()).expect("event log state is replayable");
         Self {
             log: Arc::new(Mutex::new(log)),
+            storage: Arc::new(Mutex::new(storage)),
+            durable_log: None,
             auth: Arc::new(AuthConfig::disabled()),
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
-            slow_query_threshold: Duration::from_millis(100),
+            idempotency_path: None,
+            slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            default_query_limit: DEFAULT_QUERY_LIMIT,
+            max_query_limit: DEFAULT_MAX_QUERY_LIMIT,
+            max_path_depth: DEFAULT_MAX_PATH_DEPTH,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            metrics: Arc::new(Mutex::new(ApiMetrics::default())),
+        }
+    }
+
+    pub fn from_file_event_log(path: impl AsRef<FsPath>) -> Result<Self, StorageError> {
+        let file_log = FileEventLog::open(path)?;
+        let events = file_log.read_all()?;
+        let storage = InMemoryStorage::replay(&events)?;
+        let log = EventLog::from_events(events).map_err(StorageError::Replay)?;
+        Ok(Self {
+            log: Arc::new(Mutex::new(log)),
+            storage: Arc::new(Mutex::new(storage)),
+            durable_log: Some(Arc::new(Mutex::new(file_log))),
+            auth: Arc::new(AuthConfig::disabled()),
+            idempotency: Arc::new(Mutex::new(BTreeMap::new())),
+            idempotency_path: None,
+            slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            default_query_limit: DEFAULT_QUERY_LIMIT,
+            max_query_limit: DEFAULT_MAX_QUERY_LIMIT,
+            max_path_depth: DEFAULT_MAX_PATH_DEPTH,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            metrics: Arc::new(Mutex::new(ApiMetrics::default())),
+        })
+    }
+
+    pub fn from_durable_event_log(path: impl AsRef<FsPath>) -> Result<Self, StorageError> {
+        Self::from_file_event_log(path)
+    }
+
+    pub fn from_env() -> Result<Self, ApiConfigError> {
+        let mut state = if let Some(path) = std::env::var_os("RG_EVENT_LOG_PATH") {
+            Self::from_durable_event_log(PathBuf::from(path)).map_err(ApiConfigError::from)?
+        } else {
+            Self::new_in_memory()
+        };
+        if state.durable_log.is_none() && configured_replica_count()? > 1 {
+            return Err(ApiConfigError::new(
+                "multiple API replicas require RG_EVENT_LOG_PATH durable storage",
+            ));
+        }
+        if let Some(path) = std::env::var_os("RG_IDEMPOTENCY_LOG_PATH") {
+            state = state
+                .with_idempotency_path(PathBuf::from(path))
+                .map_err(ApiConfigError::from)?;
+        }
+
+        match std::env::var("RG_API_KEYS") {
+            Ok(value) => {
+                let auth = AuthConfig::from_env_value(&value).map_err(ApiConfigError::from)?;
+                if auth.is_enabled() {
+                    Ok(state.with_auth(auth))
+                } else if dev_auth_disabled() {
+                    Ok(state)
+                } else {
+                    Err(ApiConfigError::new(
+                        "auth is required: RG_API_KEYS did not contain any API keys",
+                    ))
+                }
+            }
+            Err(_) if dev_auth_disabled() => Ok(state),
+            Err(_) => Err(ApiConfigError::new(
+                "auth is required: set RG_API_KEYS or HOTGRAPH_DEV_AUTH_DISABLED=true for local development",
+            )),
         }
     }
 
@@ -63,8 +165,47 @@ impl ApiState {
         self
     }
 
+    pub fn with_idempotency_path(mut self, path: impl AsRef<FsPath>) -> Result<Self, StorageError> {
+        let path = path.as_ref().to_path_buf();
+        let events = self
+            .log
+            .lock()
+            .map_err(|_| StorageError::Io("event log lock poisoned".to_owned()))?
+            .events()
+            .to_vec();
+        let idempotency = read_idempotency_records(&path, &events)?;
+        self.idempotency = Arc::new(Mutex::new(idempotency));
+        self.idempotency_path = Some(Arc::new(path));
+        Ok(self)
+    }
+
     pub fn with_slow_query_threshold(mut self, threshold: Duration) -> Self {
         self.slow_query_threshold = threshold;
+        self
+    }
+
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    pub fn with_default_query_limit(mut self, default_query_limit: usize) -> Self {
+        self.default_query_limit = default_query_limit;
+        self
+    }
+
+    pub fn with_max_query_limit(mut self, max_query_limit: usize) -> Self {
+        self.max_query_limit = max_query_limit;
+        self
+    }
+
+    pub fn with_max_path_depth(mut self, max_path_depth: usize) -> Self {
+        self.max_path_depth = max_path_depth;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
         self
     }
 
@@ -73,6 +214,7 @@ impl ApiState {
         command: GraphCommand,
         idempotency_key: Option<String>,
     ) -> Result<rg_events::GraphEvent, ApiError> {
+        let start = Instant::now();
         let fingerprint = format!("{command:?}");
         if let Some(key) = &idempotency_key {
             let idempotency = self
@@ -93,33 +235,76 @@ impl ApiState {
             .log
             .lock()
             .map_err(|_| ApiError::internal("event log lock poisoned"))?;
-        let event = log.execute(command).map_err(ApiError::from)?;
+        let mut candidate = log.clone();
+        let event = candidate.execute(command).map_err(ApiError::from)?;
+        if let Some(durable_log) = &self.durable_log {
+            durable_log
+                .lock()
+                .map_err(|_| ApiError::internal("durable event log lock poisoned"))?
+                .append(&event)
+                .map_err(ApiError::from)?;
+        }
+        self.storage
+            .lock()
+            .map_err(|_| ApiError::internal("storage lock poisoned"))?
+            .append_event(event.clone())
+            .map_err(ApiError::from)?;
+        *log = candidate;
         drop(log);
 
         if let Some(key) = idempotency_key {
+            let record = IdempotencyRecord {
+                fingerprint,
+                event: event.clone(),
+            };
+            if let Some(path) = &self.idempotency_path {
+                append_idempotency_record(path, &key, &record).map_err(ApiError::from)?;
+            }
             self.idempotency
                 .lock()
                 .map_err(|_| ApiError::internal("idempotency lock poisoned"))?
-                .insert(
-                    key,
-                    IdempotencyRecord {
-                        fingerprint,
-                        event: event.clone(),
-                    },
-                );
+                .insert(key, record);
         }
+        self.record_operation("write", start.elapsed());
         Ok(event)
     }
 
+    fn apply_query_limits(
+        &self,
+        mut request: GraphQueryRequest,
+    ) -> Result<GraphQueryRequest, ApiError> {
+        let limit = self.normalize_query_limit(request.limit)?;
+        request.limit = Some(limit);
+        Ok(request)
+    }
+
+    fn normalize_query_limit(&self, limit: Option<usize>) -> Result<usize, ApiError> {
+        let limit = limit.unwrap_or(self.default_query_limit);
+        if limit > self.max_query_limit {
+            return Err(ApiError::bad_request(format!(
+                "query limit {limit} exceeds configured max {}",
+                self.max_query_limit
+            )));
+        }
+        Ok(limit)
+    }
+
+    fn validate_path_depth(&self, request: &PathQueryRequest) -> Result<(), ApiError> {
+        if request.max_depth > self.max_path_depth {
+            Err(ApiError::bad_request(format!(
+                "path max_depth {} exceeds configured max {}",
+                request.max_depth, self.max_path_depth
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     fn storage_snapshot(&self) -> Result<InMemoryStorage, ApiError> {
-        let events = {
-            let log = self
-                .log
-                .lock()
-                .map_err(|_| ApiError::internal("event log lock poisoned"))?;
-            log.events().to_vec()
-        };
-        InMemoryStorage::replay(&events).map_err(ApiError::from)
+        self.storage
+            .lock()
+            .map_err(|_| ApiError::internal("storage lock poisoned"))
+            .map(|storage| storage.clone())
     }
 
     fn metrics_snapshot(&self) -> Result<MetricsResponse, ApiError> {
@@ -150,6 +335,11 @@ impl ApiState {
 
     fn prometheus_metrics(&self) -> Result<String, ApiError> {
         let metrics = self.metrics_snapshot()?;
+        let latency = self
+            .metrics
+            .lock()
+            .map_err(|_| ApiError::internal("metrics lock poisoned"))?
+            .prometheus_histograms();
         Ok(format!(
             "# HELP rg_graph_events_total Total events appended to the Reality Graph log.\n\
              # TYPE rg_graph_events_total counter\n\
@@ -168,13 +358,20 @@ impl ApiState {
              rg_graph_agent_memories_total {}\n\
              # HELP rg_graph_index_health Index health status, where 1 is healthy.\n\
              # TYPE rg_graph_index_health gauge\n\
-             rg_graph_index_health 1\n",
+             rg_graph_index_health 1\n\
+             {latency}",
             metrics.events,
             metrics.entities,
             metrics.assertions,
             metrics.sources,
             metrics.agent_memories
         ))
+    }
+
+    fn record_operation(&self, operation: &'static str, duration: Duration) {
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record(operation, duration);
+        }
     }
 
     fn generated_tx(&self) -> Result<TxTime, ApiError> {
@@ -190,6 +387,122 @@ impl ApiState {
 struct IdempotencyRecord {
     fingerprint: String,
     event: rg_events::GraphEvent,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ApiMetrics {
+    durations: BTreeMap<&'static str, Vec<f64>>,
+}
+
+impl ApiMetrics {
+    fn record(&mut self, operation: &'static str, duration: Duration) {
+        self.durations
+            .entry(operation)
+            .or_default()
+            .push(duration.as_secs_f64());
+    }
+
+    fn prometheus_histograms(&self) -> String {
+        let mut output = String::from(
+            "# HELP rg_api_request_duration_seconds API request duration by operation.\n\
+             # TYPE rg_api_request_duration_seconds histogram\n",
+        );
+        for operation in ["write", "query", "path", "evidence_pack", "ai_context_pack"] {
+            let values = self
+                .durations
+                .get(operation)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for bucket in [0.05_f64, 0.1, 0.5, 1.0, 5.0] {
+                let count = values.iter().filter(|value| **value <= bucket).count();
+                output.push_str(&format!(
+                    "rg_api_request_duration_seconds_bucket{{operation=\"{operation}\",le=\"{bucket}\"}} {count}\n"
+                ));
+            }
+            output.push_str(&format!(
+                "rg_api_request_duration_seconds_bucket{{operation=\"{operation}\",le=\"+Inf\"}} {}\n",
+                values.len()
+            ));
+            output.push_str(&format!(
+                "rg_api_request_duration_seconds_sum{{operation=\"{operation}\"}} {}\n",
+                values.iter().sum::<f64>()
+            ));
+            output.push_str(&format!(
+                "rg_api_request_duration_seconds_count{{operation=\"{operation}\"}} {}\n",
+                values.len()
+            ));
+        }
+        output
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedIdempotencyRecord {
+    key: String,
+    fingerprint: String,
+    event_id: String,
+}
+
+fn read_idempotency_records(
+    path: &FsPath,
+    events: &[rg_events::GraphEvent],
+) -> Result<BTreeMap<String, IdempotencyRecord>, StorageError> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+    let events_by_id = events
+        .iter()
+        .map(|event| (event.event_id().as_str().to_owned(), event.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let file = File::open(path).map_err(|error| StorageError::Io(error.to_string()))?;
+    let reader = BufReader::new(file);
+    let mut records = BTreeMap::new();
+    for line in reader.lines() {
+        let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let persisted = serde_json::from_str::<PersistedIdempotencyRecord>(&line)
+            .map_err(|error| StorageError::Codec(error.to_string()))?;
+        let event = events_by_id.get(&persisted.event_id).ok_or_else(|| {
+            StorageError::Codec(format!(
+                "idempotency record references missing event {}",
+                persisted.event_id
+            ))
+        })?;
+        records.insert(
+            persisted.key,
+            IdempotencyRecord {
+                fingerprint: persisted.fingerprint,
+                event: event.clone(),
+            },
+        );
+    }
+    Ok(records)
+}
+
+fn append_idempotency_record(
+    path: &FsPath,
+    key: &str,
+    record: &IdempotencyRecord,
+) -> Result<(), StorageError> {
+    let persisted = PersistedIdempotencyRecord {
+        key: key.to_owned(),
+        fingerprint: record.fingerprint.clone(),
+        event_id: record.event.event_id().as_str().to_owned(),
+    };
+    let line = serde_json::to_string(&persisted)
+        .map_err(|error| StorageError::Codec(error.to_string()))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+    writeln!(file, "{line}").map_err(|error| StorageError::Io(error.to_string()))?;
+    file.sync_data()
+        .map_err(|error| StorageError::Io(error.to_string()))
 }
 
 pub trait QuestionEmbeddingProvider {
@@ -274,9 +587,18 @@ fn role_rank(role: &ApiRole) -> u8 {
     }
 }
 
+fn hash_api_key(api_key: &str) -> String {
+    let digest = Sha256::digest(api_key.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct ServiceAccount {
-    api_key: String,
+    api_key_hash: String,
     service_account_id: String,
     tenant_id: TenantId,
     roles: Vec<ApiRole>,
@@ -289,11 +611,12 @@ impl ServiceAccount {
         tenant_id: impl Into<String>,
         roles: Vec<ApiRole>,
     ) -> Self {
+        let api_key = api_key.into();
         let mut roles = roles;
         roles.sort_by_key(role_rank);
         roles.dedup();
         Self {
-            api_key: api_key.into(),
+            api_key_hash: hash_api_key(&api_key),
             service_account_id: service_account_id.into(),
             tenant_id: TenantId::new(tenant_id.into()),
             roles,
@@ -305,7 +628,7 @@ impl std::fmt::Debug for ServiceAccount {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ServiceAccount")
-            .field("api_key", &"<redacted>")
+            .field("api_key_hash", &self.api_key_hash)
             .field("service_account_id", &self.service_account_id)
             .field("tenant_id", &self.tenant_id)
             .field("roles", &self.roles)
@@ -322,7 +645,9 @@ pub struct ApiPrincipal {
 
 impl ApiPrincipal {
     fn has_role(&self, required: ApiRole) -> bool {
-        self.roles.contains(&ApiRole::Admin) || self.roles.contains(&required)
+        self.roles
+            .iter()
+            .any(|role| role_rank(role) >= role_rank(&required))
     }
 
     fn tenant_context(&self) -> ContextScope {
@@ -339,7 +664,7 @@ impl AuthConfig {
     pub fn new(accounts: Vec<ServiceAccount>) -> Self {
         let accounts_by_key = accounts
             .into_iter()
-            .map(|account| (account.api_key.clone(), account))
+            .map(|account| (account.api_key_hash.clone(), account))
             .collect();
         Self { accounts_by_key }
     }
@@ -348,23 +673,183 @@ impl AuthConfig {
         Self::default()
     }
 
-    fn is_enabled(&self) -> bool {
+    pub fn from_api_keys_env(value: &str) -> Result<Self, AuthConfigError> {
+        let mut accounts = Vec::new();
+        for (index, entry) in value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .enumerate()
+        {
+            let parts = entry.split(':').map(str::trim).collect::<Vec<_>>();
+            let account =
+                match parts.as_slice() {
+                    [api_key] => ServiceAccount::new(
+                        required_auth_part(api_key, "api key")?,
+                        format!("env-service-account-{}", index + 1),
+                        "default",
+                        vec![ApiRole::Writer],
+                    ),
+                    [api_key, service_account_id, tenant_id, roles] => ServiceAccount::new(
+                        required_auth_part(api_key, "api key")?,
+                        required_auth_part(service_account_id, "service account id")?,
+                        required_auth_part(tenant_id, "tenant id")?,
+                        parse_roles(roles)?,
+                    ),
+                    _ => return Err(AuthConfigError::new(
+                        "RG_API_KEYS entries must be `key` or `key:service_account:tenant:roles`",
+                    )),
+                };
+            if accounts
+                .iter()
+                .any(|existing: &ServiceAccount| existing.api_key_hash == account.api_key_hash)
+            {
+                return Err(AuthConfigError::new("duplicate API key in RG_API_KEYS"));
+            }
+            accounts.push(account);
+        }
+        Ok(Self::new(accounts))
+    }
+
+    pub fn from_env_value(value: &str) -> Result<Self, AuthConfigError> {
+        Self::from_api_keys_env(value)
+    }
+
+    pub fn is_enabled(&self) -> bool {
         !self.accounts_by_key.is_empty()
     }
 
-    fn authenticate(&self, api_key: &str) -> Option<ApiPrincipal> {
+    pub fn authenticate(&self, api_key: &str) -> Option<ApiPrincipal> {
         self.accounts_by_key
-            .get(api_key)
+            .get(&hash_api_key(api_key))
             .map(|account| ApiPrincipal {
                 service_account_id: account.service_account_id.clone(),
                 tenant_id: account.tenant_id.clone(),
                 roles: account.roles.clone(),
             })
     }
+
+    pub fn debug_key_material(&self) -> Vec<String> {
+        self.accounts_by_key
+            .values()
+            .map(|account| {
+                format!(
+                    "{}:{}:{:?}",
+                    account.service_account_id, account.tenant_id, account.roles
+                )
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct ApiConfigError {
+    message: String,
+}
+
+impl ApiConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ApiConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ApiConfigError {}
+
+impl From<AuthConfigError> for ApiConfigError {
+    fn from(error: AuthConfigError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<StorageError> for ApiConfigError {
+    fn from(error: StorageError) -> Self {
+        Self::new(format!("{error:?}"))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthConfigError {
+    message: String,
+}
+
+impl AuthConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AuthConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AuthConfigError {}
+
+fn required_auth_part<'a>(value: &'a str, field: &str) -> Result<&'a str, AuthConfigError> {
+    if value.is_empty() {
+        Err(AuthConfigError::new(format!(
+            "RG_API_KEYS {field} must not be empty"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
+fn parse_roles(value: &str) -> Result<Vec<ApiRole>, AuthConfigError> {
+    let roles = value
+        .split(['+', '|'])
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(|role| match role.to_ascii_lowercase().as_str() {
+            "reader" => Ok(ApiRole::Reader),
+            "writer" => Ok(ApiRole::Writer),
+            "admin" => Ok(ApiRole::Admin),
+            other => Err(AuthConfigError::new(format!(
+                "unknown RG_API_KEYS role `{other}`"
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if roles.is_empty() {
+        Err(AuthConfigError::new(
+            "RG_API_KEYS roles must include reader, writer, or admin",
+        ))
+    } else {
+        Ok(roles)
+    }
+}
+
+fn dev_auth_disabled() -> bool {
+    std::env::var("HOTGRAPH_DEV_AUTH_DISABLED")
+        .or_else(|_| std::env::var("RG_DEV_AUTH_DISABLED"))
+        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+fn configured_replica_count() -> Result<usize, ApiConfigError> {
+    match std::env::var("HOTGRAPH_REPLICA_COUNT").or_else(|_| std::env::var("RG_REPLICA_COUNT")) {
+        Ok(value) => value.trim().parse::<usize>().map_err(|_| {
+            ApiConfigError::new(
+                "HOTGRAPH_REPLICA_COUNT/RG_REPLICA_COUNT must be a positive integer",
+            )
+        }),
+        Err(_) => Ok(1),
+    }
 }
 
 pub fn router(state: ApiState) -> Router {
     let auth_state = state.clone();
+    let timeout_state = state.clone();
+    let max_body_bytes = state.max_body_bytes;
     Router::new()
         .route("/v1/entities", post(create_entity))
         .route("/v1/assertions", post(add_assertion))
@@ -384,6 +869,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/metrics.json", get(metrics_json))
         .route("/v1/openapi.json", get(openapi_endpoint))
         .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            timeout_state,
+            timeout_middleware,
+        ))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
 
@@ -463,6 +953,17 @@ async fn auth_middleware(
         principal: Some(principal),
     });
     next.run(request).await
+}
+
+async fn timeout_middleware(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(state.request_timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => ApiError::request_timeout("request exceeded configured deadline").into_response(),
+    }
 }
 
 fn required_role(method: &Method, path: &str) -> Option<ApiRole> {
@@ -580,12 +1081,14 @@ async fn add_source(
 ) -> Result<Json<SourceResponse>, ApiError> {
     let source_id = source_id_from_request(&request);
     let command = add_source_command(request, source_id.clone())?;
-    state.execute(GraphCommand::AddSource(command), idempotency_key(&headers)?)?;
+    let event = state.execute(GraphCommand::AddSource(command), idempotency_key(&headers)?)?;
     let storage = state.storage_snapshot()?;
     let source = storage
         .source(&source_id)
         .ok_or_else(|| ApiError::internal("source was not materialized"))?;
-    Ok(Json(SourceResponse::from(source)))
+    let mut response = SourceResponse::from(source);
+    response.event_type = Some(event_type_name(&event).to_owned());
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -648,7 +1151,10 @@ async fn execute_query(
     let storage = state.storage_snapshot()?;
     let engine = QueryEngine::from_storage(storage);
     let results = engine
-        .execute_graph(graph_query_from_request(request, context.tenant_context())?)
+        .execute_graph(graph_query_from_request(
+            state.apply_query_limits(request)?,
+            context.tenant_context(),
+        )?)
         .iter()
         .map(QueryResultResponse::from)
         .collect();
@@ -669,6 +1175,7 @@ async fn execute_path(
     Json(request): Json<PathQueryRequest>,
 ) -> Result<Json<PathResponse>, ApiError> {
     let start = Instant::now();
+    state.validate_path_depth(&request)?;
     let storage = state.storage_snapshot()?;
     let engine = QueryEngine::from_storage(storage);
     let tenant_context = context.tenant_context();
@@ -703,8 +1210,17 @@ async fn evidence_pack(
         .map_or_else(|| state.generated_tx(), |value| Ok(TxTime::new(value)))?;
     let pack = generator.generate(AiEvidencePackRequest {
         query: request.query,
-        graph_query: graph_query_from_request(request.graph_query, tenant_context.clone())?,
-        path_query: request.path_query.map(TryInto::try_into).transpose()?,
+        graph_query: graph_query_from_request(
+            state.apply_query_limits(request.graph_query)?,
+            tenant_context.clone(),
+        )?,
+        path_query: request
+            .path_query
+            .map(|request| {
+                state.validate_path_depth(&request)?;
+                request.try_into()
+            })
+            .transpose()?,
         generated_at,
     });
     let mut response = EvidencePackResponse::from(&pack);
@@ -729,6 +1245,7 @@ async fn ai_context_pack(
     let storage = state.storage_snapshot()?;
     let tenant_context = context.tenant_context();
     let intent = ai_context_pack_intent(&storage, &request, tenant_context.clone())?;
+    let limit = state.normalize_query_limit(intent.limit)?;
     let graph_query = GraphQuery {
         subject: intent.subject.clone().map(EntityPattern::Id),
         predicate: intent.predicate.clone().map(PredicatePattern::Id),
@@ -737,7 +1254,7 @@ async fn ai_context_pack(
         known_at: intent.known_at,
         context: intent.context,
         min_confidence: intent.min_confidence,
-        limit: intent.limit,
+        limit: Some(limit),
     };
     let path_query = intent.subject.clone().map(|start| PathQuery {
         start,
@@ -1059,6 +1576,8 @@ pub struct SourceResponse {
     pub content_hash: String,
     pub observed_at: i64,
     pub trust_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -1248,6 +1767,13 @@ impl ApiError {
         }
     }
 
+    fn request_timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: message.into(),
+        }
+    }
+
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -1344,6 +1870,7 @@ impl From<&Source> for SourceResponse {
             content_hash: source.content_hash.as_str().to_owned(),
             observed_at: source.observed_at.as_i64(),
             trust_score: source.trust_score,
+            event_type: None,
         }
     }
 }
@@ -1828,6 +2355,14 @@ fn retain_evidence_response_for_tenant(
 
 fn log_slow_query(state: &ApiState, operation: &'static str, start: Instant) {
     let elapsed = start.elapsed();
+    let metric_operation = match operation {
+        "graph_query" => "query",
+        "path_query" => "path",
+        "evidence_pack" => "evidence_pack",
+        "ai_context_pack" => "ai_context_pack",
+        other => other,
+    };
+    state.record_operation(metric_operation, elapsed);
     if elapsed >= state.slow_query_threshold {
         warn!(operation, elapsed_ms = elapsed.as_millis(), "slow_query");
     }

@@ -9,10 +9,15 @@ services:
     environment:
       RG_API_ADDR: 0.0.0.0:8080
       RUST_LOG: info,rg_api=debug
+      HOTGRAPH_DEV_AUTH_DISABLED: ${HOTGRAPH_DEV_AUTH_DISABLED:-true}
+      RG_EVENT_LOG_PATH: /var/lib/reality-graph/events.log
+      RG_IDEMPOTENCY_LOG_PATH: /var/lib/reality-graph/idempotency.log
       QDRANT_URL: http://qdrant:6334
-      POSTGRES_URL: postgres://reality_graph:reality_graph@postgres:5432/reality_graph
+      POSTGRES_URL: ${POSTGRES_URL:-}
     ports:
       - "8080:8080"
+    volumes:
+      - api-data:/var/lib/reality-graph
     depends_on:
       qdrant:
         condition: service_healthy
@@ -45,7 +50,7 @@ services:
     environment:
       POSTGRES_DB: reality_graph
       POSTGRES_USER: reality_graph
-      POSTGRES_PASSWORD: reality_graph
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     ports:
       - "5432:5432"
     volumes:
@@ -84,7 +89,7 @@ services:
     image: grafana/grafana:12.3.0
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD before starting Grafana}
       GF_USERS_ALLOW_SIGN_UP: "false"
     ports:
       - "3000:3000"
@@ -103,6 +108,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  api-data:
   qdrant-data:
   postgres-data:
   prometheus-data:

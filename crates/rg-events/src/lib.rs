@@ -248,7 +248,7 @@ impl GraphState {
             .collect()
     }
 
-    fn apply_event(&mut self, event: &GraphEvent) -> Result<(), GraphReplayError> {
+    pub fn apply_event(&mut self, event: &GraphEvent) -> Result<(), GraphReplayError> {
         match event {
             GraphEvent::EntityCreated(event) => {
                 self.entities
@@ -405,6 +405,20 @@ impl EventLog {
             next_sequence: 1,
             ontology: None,
         }
+    }
+
+    pub fn from_events(events: Vec<GraphEvent>) -> Result<Self, GraphReplayError> {
+        let state = GraphState::replay(&events)?;
+        let last_tx = events
+            .last()
+            .map_or_else(|| TxTime::new(0), GraphEvent::transaction_time);
+        Ok(Self {
+            next_sequence: events.len() as u64 + 1,
+            events,
+            state,
+            last_tx,
+            ontology: None,
+        })
     }
 
     pub fn with_ontology(start_tx: TxTime, ontology: GraphOntology) -> Self {

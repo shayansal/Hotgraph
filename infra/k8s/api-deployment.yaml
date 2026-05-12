@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/name: reality-graph-api
     app.kubernetes.io/part-of: reality-graph
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: reality-graph-api
@@ -24,11 +24,14 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: api
-          image: reality-graph-api:latest
+          image: registry.example.com/reality-graph-api:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -42,7 +45,14 @@ spec:
                 secretKeyRef:
                   name: reality-graph-secrets
                   key: RG_API_KEYS
-                  optional: true
+                  optional: false
+            - name: RG_EVENT_LOG_PATH
+              value: /var/lib/reality-graph/events.log
+            - name: RG_IDEMPOTENCY_LOG_PATH
+              value: /var/lib/reality-graph/idempotency.log
+          volumeMounts:
+            - name: api-data
+              mountPath: /var/lib/reality-graph
           readinessProbe:
             httpGet:
               path: /v1/health
@@ -72,3 +82,7 @@ spec:
             capabilities:
               drop:
                 - ALL
+      volumes:
+        - name: api-data
+          persistentVolumeClaim:
+            claimName: reality-graph-api-data

@@ -16,8 +16,9 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind API listener");
+    let state = ApiState::from_env().expect("load API state from environment");
 
-    serve_with_graceful_shutdown(listener, ApiState::new_in_memory(), shutdown_signal())
+    serve_with_graceful_shutdown(listener, state, shutdown_signal())
         .await
         .expect("serve API");
 }

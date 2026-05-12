@@ -4,6 +4,7 @@ kind: Kustomization
 resources:
   - namespace.yaml
   - configmap.yaml
+  - api-pvc.yaml
   - api-deployment.yaml
   - worker-deployment.yaml
   - qdrant-statefulset.yaml

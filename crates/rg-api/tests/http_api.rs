@@ -8,8 +8,13 @@ use rg_api::{
     QuestionEmbeddingProvider, ServiceAccount,
 };
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[tokio::test]
 async fn api_creates_queries_paths_and_evidence_packs_against_in_memory_graph() {
@@ -234,6 +239,228 @@ async fn auth_middleware_enforces_api_keys_roles_and_masks_secrets() {
 
     let health = request_empty(app, "GET", "/v1/health").await;
     assert_eq!(health["status"], "ok");
+}
+
+#[tokio::test]
+async fn production_env_requires_auth_unless_dev_override() {
+    let _env_guard = ENV_LOCK.lock().expect("env lock");
+    let previous_keys = std::env::var("RG_API_KEYS").ok();
+    let previous_dev = std::env::var("HOTGRAPH_DEV_AUTH_DISABLED").ok();
+    let previous_log = std::env::var("RG_EVENT_LOG_PATH").ok();
+    let previous_replicas = std::env::var("RG_REPLICA_COUNT").ok();
+    std::env::remove_var("RG_API_KEYS");
+    std::env::remove_var("HOTGRAPH_DEV_AUTH_DISABLED");
+    std::env::remove_var("RG_EVENT_LOG_PATH");
+    std::env::remove_var("RG_REPLICA_COUNT");
+
+    let error = ApiState::from_env().expect_err("production env without auth must fail");
+    assert!(error.to_string().contains("auth"));
+
+    std::env::set_var("HOTGRAPH_DEV_AUTH_DISABLED", "true");
+    ApiState::from_env().expect("dev override allows local disabled auth");
+
+    restore_env("RG_API_KEYS", previous_keys);
+    restore_env("HOTGRAPH_DEV_AUTH_DISABLED", previous_dev);
+    restore_env("RG_EVENT_LOG_PATH", previous_log);
+    restore_env("RG_REPLICA_COUNT", previous_replicas);
+}
+
+#[tokio::test]
+async fn production_env_rejects_multiple_replicas_without_durable_storage() {
+    let _env_guard = ENV_LOCK.lock().expect("env lock");
+    let previous_keys = std::env::var("RG_API_KEYS").ok();
+    let previous_dev = std::env::var("HOTGRAPH_DEV_AUTH_DISABLED").ok();
+    let previous_log = std::env::var("RG_EVENT_LOG_PATH").ok();
+    let previous_replicas = std::env::var("RG_REPLICA_COUNT").ok();
+    std::env::set_var(
+        "RG_API_KEYS",
+        "writer-secret:writer:tenant-lab:reader|writer",
+    );
+    std::env::remove_var("HOTGRAPH_DEV_AUTH_DISABLED");
+    std::env::remove_var("RG_EVENT_LOG_PATH");
+    std::env::set_var("RG_REPLICA_COUNT", "2");
+
+    let error =
+        ApiState::from_env().expect_err("multiple replicas without durable storage must fail");
+    assert!(error.to_string().contains("multiple API replicas"));
+
+    std::env::set_var("RG_EVENT_LOG_PATH", temp_file("api-env-events"));
+    ApiState::from_env().expect("durable event log allows configured replica count");
+
+    restore_env("RG_API_KEYS", previous_keys);
+    restore_env("HOTGRAPH_DEV_AUTH_DISABLED", previous_dev);
+    restore_env("RG_EVENT_LOG_PATH", previous_log);
+    restore_env("RG_REPLICA_COUNT", previous_replicas);
+}
+
+#[tokio::test]
+async fn auth_config_parses_env_accounts_and_does_not_store_raw_keys() {
+    let auth = AuthConfig::from_env_value(
+        "writer-secret:writer-sa:tenant-a:reader|writer,admin-secret:admin-sa:tenant-a:admin",
+    )
+    .expect("parse env auth");
+
+    assert!(auth.authenticate("writer-secret").is_some());
+    assert!(auth.authenticate("admin-secret").is_some());
+    assert!(auth
+        .debug_key_material()
+        .iter()
+        .all(|value| { !value.contains("writer-secret") && !value.contains("admin-secret") }));
+}
+
+#[tokio::test]
+async fn durable_api_state_recovers_events_and_idempotency_after_restart() {
+    let event_log_path = temp_file("api-events");
+    let idempotency_path = temp_file("api-idempotency");
+    {
+        let app = router(
+            ApiState::from_durable_event_log(&event_log_path)
+                .expect("durable state")
+                .with_idempotency_path(&idempotency_path)
+                .expect("idempotency persistence")
+                .with_auth(AuthConfig::new(vec![ServiceAccount::new(
+                    "writer-key",
+                    "writer",
+                    "tenant-lab",
+                    vec![ApiRole::Reader, ApiRole::Writer],
+                )])),
+        );
+        request_json_with_headers(
+            app,
+            "POST",
+            "/v1/sources",
+            json!({
+                "id": "source-restart",
+                "source_type": "Document",
+                "content_hash": "sha256:restart"
+            }),
+            &[
+                ("x-api-key", "writer-key"),
+                ("idempotency-key", "source-restart-once"),
+            ],
+        )
+        .await;
+    }
+
+    let restarted = router(
+        ApiState::from_durable_event_log(&event_log_path)
+            .expect("reload durable state")
+            .with_idempotency_path(&idempotency_path)
+            .expect("reload idempotency")
+            .with_auth(AuthConfig::new(vec![ServiceAccount::new(
+                "writer-key",
+                "writer",
+                "tenant-lab",
+                vec![ApiRole::Reader, ApiRole::Writer],
+            )])),
+    );
+    let source = request_text_with_headers(
+        restarted.clone(),
+        "GET",
+        "/v1/sources/source-restart",
+        &[("x-api-key", "writer-key")],
+    )
+    .await;
+    assert!(source.contains("source-restart"));
+
+    let replayed = request_json_with_headers(
+        restarted.clone(),
+        "POST",
+        "/v1/sources",
+        json!({
+            "id": "source-restart",
+            "source_type": "Document",
+            "content_hash": "sha256:restart"
+        }),
+        &[
+            ("x-api-key", "writer-key"),
+            ("idempotency-key", "source-restart-once"),
+        ],
+    )
+    .await;
+    assert_eq!(replayed["event_type"], "source_added");
+    let metrics = request_text_with_headers(
+        restarted,
+        "GET",
+        "/v1/metrics",
+        &[("x-api-key", "writer-key")],
+    )
+    .await;
+    assert!(metrics.contains("rg_graph_events_total 1"));
+
+    let _ = fs::remove_file(event_log_path);
+    let _ = fs::remove_file(idempotency_path);
+}
+
+#[tokio::test]
+async fn request_limits_query_defaults_and_histograms_are_enforced() {
+    let body_limited_app = router(ApiState::new_in_memory().with_max_body_bytes(64).with_auth(
+        AuthConfig::new(vec![ServiceAccount::new(
+            "reader-key",
+            "reader",
+            "tenant-lab",
+            vec![ApiRole::Reader],
+        )]),
+    ));
+
+    let oversized = raw_json(
+        body_limited_app,
+        "POST",
+        "/v1/query",
+        json!({
+            "predicate": "WORKED_AT",
+            "context": "tenant:tenant-lab",
+            "padding": "this request body is intentionally too large for the configured API body limit"
+        }),
+        &[("x-api-key", "reader-key")],
+    )
+    .await;
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let app = router(
+        ApiState::new_in_memory()
+            .with_default_query_limit(25)
+            .with_max_query_limit(50)
+            .with_max_path_depth(3)
+            .with_auth(AuthConfig::new(vec![ServiceAccount::new(
+                "reader-key",
+                "reader",
+                "tenant-lab",
+                vec![ApiRole::Reader],
+            )])),
+    );
+
+    let path_too_deep = raw_json(
+        app.clone(),
+        "POST",
+        "/v1/path",
+        json!({
+            "start": "person-a",
+            "predicates": [],
+            "max_depth": 4
+        }),
+        &[("x-api-key", "reader-key")],
+    )
+    .await;
+    assert_eq!(path_too_deep.status(), StatusCode::BAD_REQUEST);
+
+    let query_limit = raw_json(
+        app.clone(),
+        "POST",
+        "/v1/query",
+        json!({
+            "predicate": "WORKED_AT",
+            "limit": 10000
+        }),
+        &[("x-api-key", "reader-key")],
+    )
+    .await;
+    assert_eq!(query_limit.status(), StatusCode::BAD_REQUEST);
+
+    let metrics =
+        request_text_with_headers(app, "GET", "/v1/metrics", &[("x-api-key", "reader-key")]).await;
+    assert!(metrics.contains("rg_api_request_duration_seconds_bucket"));
+    assert!(metrics.contains("operation=\"query\""));
 }
 
 #[tokio::test]
@@ -665,6 +892,29 @@ fn authenticated_state() -> ApiState {
             ),
         ]))
         .with_slow_query_threshold(Duration::from_secs(10))
+}
+
+fn temp_file(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "hotgraph-api-{name}-{}-{}-{nonce}.log",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let _ = fs::remove_file(&path);
+    path
+}
+
+fn restore_env(name: &str, value: Option<String>) {
+    if let Some(value) = value {
+        std::env::set_var(name, value);
+    } else {
+        std::env::remove_var(name);
+    }
 }
 
 async fn seed_tenant_graph(
