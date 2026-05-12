@@ -313,77 +313,490 @@ impl FileEventLog {
     }
 
     pub fn read_records(&self) -> Result<Vec<WalRecord>, StorageError> {
-        let file = File::open(&self.path).map_err(|error| StorageError::Io(error.to_string()))?;
-        let reader = BufReader::new(file);
-        let mut records = Vec::new();
-        for line in reader.lines() {
-            let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let expected_sequence = records.len() as u64 + 1;
-            let record = decode_event_record(&line, expected_sequence)?;
-            records.push(record);
-        }
-        Ok(records)
+        read_wal_records_from_path(&self.path, 1)
     }
 
     pub fn recover_truncate_to_last_good(&mut self) -> Result<WalRecoveryReport, StorageError> {
-        let bytes = fs::read(&self.path).map_err(|error| StorageError::Io(error.to_string()))?;
-        let mut start = 0_usize;
-        let mut last_good_end = 0_usize;
-        let mut records_recovered = 0_u64;
-        let mut corruption_reason = None;
-
-        while start < bytes.len() {
-            let Some(relative_end) = bytes[start..].iter().position(|byte| *byte == b'\n') else {
-                corruption_reason = Some("partial WAL record tail".to_owned());
-                break;
-            };
-            let end = start + relative_end + 1;
-            let line = String::from_utf8(bytes[start..end - 1].to_vec())
-                .map_err(|error| StorageError::Codec(error.to_string()))?;
-            if line.trim().is_empty() {
-                last_good_end = end;
-                start = end;
-                continue;
-            }
-            match decode_event_record(&line, records_recovered + 1) {
-                Ok(_) => {
-                    records_recovered += 1;
-                    last_good_end = end;
-                    start = end;
-                }
-                Err(error) => {
-                    corruption_reason = Some(format!("{error:?}"));
-                    break;
-                }
-            }
-        }
-
-        let bytes_quarantined = bytes.len().saturating_sub(last_good_end) as u64;
-        if bytes_quarantined > 0 {
-            let file = OpenOptions::new()
-                .write(true)
-                .open(&self.path)
-                .map_err(|error| StorageError::Io(error.to_string()))?;
-            file.set_len(last_good_end as u64)
-                .map_err(|error| StorageError::Io(error.to_string()))?;
-            file.sync_data()
-                .map_err(|error| StorageError::Io(error.to_string()))?;
-        }
-
-        Ok(WalRecoveryReport {
-            records_recovered,
-            last_good_sequence: (records_recovered > 0).then_some(records_recovered),
-            bytes_quarantined,
-            corruption_reason,
-        })
+        recover_wal_path_truncate_to_last_good(&self.path, 1)
     }
 
     fn next_sequence(&self) -> Result<u64, StorageError> {
         Ok(self.read_records()?.len() as u64 + 1)
     }
+}
+
+fn read_wal_records_from_path(
+    path: impl AsRef<Path>,
+    first_expected_sequence: u64,
+) -> Result<Vec<WalRecord>, StorageError> {
+    let file = File::open(path).map_err(|error| StorageError::Io(error.to_string()))?;
+    let reader = BufReader::new(file);
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|error| StorageError::Io(error.to_string()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let expected_sequence = first_expected_sequence + records.len() as u64;
+        let record = decode_event_record(&line, expected_sequence)?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn recover_wal_path_truncate_to_last_good(
+    path: impl AsRef<Path>,
+    first_expected_sequence: u64,
+) -> Result<WalRecoveryReport, StorageError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|error| StorageError::Io(error.to_string()))?;
+    let mut start = 0_usize;
+    let mut last_good_end = 0_usize;
+    let mut records_recovered = 0_u64;
+    let mut corruption_reason = None;
+
+    while start < bytes.len() {
+        let Some(relative_end) = bytes[start..].iter().position(|byte| *byte == b'\n') else {
+            corruption_reason = Some("partial WAL record tail".to_owned());
+            break;
+        };
+        let end = start + relative_end + 1;
+        let line = String::from_utf8(bytes[start..end - 1].to_vec())
+            .map_err(|error| StorageError::Codec(error.to_string()))?;
+        if line.trim().is_empty() {
+            last_good_end = end;
+            start = end;
+            continue;
+        }
+        match decode_event_record(&line, first_expected_sequence + records_recovered) {
+            Ok(_) => {
+                records_recovered += 1;
+                last_good_end = end;
+                start = end;
+            }
+            Err(error) => {
+                corruption_reason = Some(format!("{error:?}"));
+                break;
+            }
+        }
+    }
+
+    let bytes_quarantined = bytes.len().saturating_sub(last_good_end) as u64;
+    if bytes_quarantined > 0 {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        file.set_len(last_good_end as u64)
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        file.sync_data()
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+    }
+
+    Ok(WalRecoveryReport {
+        records_recovered,
+        last_good_sequence: (records_recovered > 0)
+            .then_some(first_expected_sequence + records_recovered - 1),
+        bytes_quarantined,
+        corruption_reason,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentedWalOptions {
+    pub max_segment_events: usize,
+    pub fsync_policy: FsyncPolicy,
+    pub archive_dir: Option<PathBuf>,
+    pub quarantine_dir: Option<PathBuf>,
+}
+
+impl SegmentedWalOptions {
+    pub fn new(max_segment_events: usize) -> Self {
+        Self {
+            max_segment_events: max_segment_events.max(1),
+            fsync_policy: FsyncPolicy::EveryWrite,
+            archive_dir: None,
+            quarantine_dir: None,
+        }
+    }
+
+    pub fn with_fsync_policy(mut self, policy: FsyncPolicy) -> Self {
+        self.fsync_policy = policy;
+        self
+    }
+
+    pub fn with_archive_dir(mut self, path: impl AsRef<Path>) -> Self {
+        self.archive_dir = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn with_quarantine_dir(mut self, path: impl AsRef<Path>) -> Self {
+        self.quarantine_dir = Some(path.as_ref().to_path_buf());
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SegmentedWal {
+    dir: PathBuf,
+    options: SegmentedWalOptions,
+}
+
+impl SegmentedWal {
+    pub fn open(dir: impl AsRef<Path>, options: SegmentedWalOptions) -> Result<Self, StorageError> {
+        let dir = dir.as_ref().to_path_buf();
+        fs::create_dir_all(&dir).map_err(|error| StorageError::Io(error.to_string()))?;
+        if let Some(archive_dir) = &options.archive_dir {
+            fs::create_dir_all(archive_dir).map_err(|error| StorageError::Io(error.to_string()))?;
+        }
+        if let Some(quarantine_dir) = &options.quarantine_dir {
+            fs::create_dir_all(quarantine_dir)
+                .map_err(|error| StorageError::Io(error.to_string()))?;
+        }
+        Ok(Self { dir, options })
+    }
+
+    pub fn append(&mut self, event: &GraphEvent) -> Result<(), StorageError> {
+        self.append_with_metadata(event, WalAppendMetadata::new())
+    }
+
+    pub fn append_with_metadata(
+        &mut self,
+        event: &GraphEvent,
+        metadata: WalAppendMetadata,
+    ) -> Result<(), StorageError> {
+        let sequence = self.next_sequence()?;
+        let segment_id = self.active_segment_id()?;
+        let path = self.segment_path(segment_id);
+        let record = WalRecord::new(sequence, event.clone(), metadata.idempotency_key);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        file.write_all(encode_event_record(&record).as_bytes())
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        file.write_all(b"\n")
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        if self.options.fsync_policy.should_sync(sequence) {
+            file.sync_data()
+                .map_err(|error| StorageError::Io(error.to_string()))?;
+        }
+        self.rewrite_segment_manifest(segment_id)?;
+        Ok(())
+    }
+
+    pub fn read_all(&self) -> Result<Vec<GraphEvent>, StorageError> {
+        self.read_records()
+            .map(|records| records.into_iter().map(|record| record.event).collect())
+    }
+
+    pub fn read_records(&self) -> Result<Vec<WalRecord>, StorageError> {
+        let mut out = Vec::new();
+        let mut expected_next = None;
+        for segment_id in self.segment_ids()? {
+            let manifest = self.read_segment_manifest(segment_id)?;
+            if let Some(expected) = expected_next {
+                if manifest.first_sequence != expected {
+                    return Err(StorageError::Codec(format!(
+                        "WAL segment sequence gap: expected first sequence {expected}, got {}",
+                        manifest.first_sequence
+                    )));
+                }
+            }
+            let records = self.read_segment_records_with_manifest(&manifest)?;
+            expected_next = Some(manifest.last_sequence + 1);
+            out.extend(records);
+        }
+        Ok(out)
+    }
+
+    pub fn read_tail_after(&self, sequence: u64) -> Result<Vec<WalRecord>, StorageError> {
+        Ok(self
+            .read_records()?
+            .into_iter()
+            .filter(|record| record.sequence > sequence)
+            .collect())
+    }
+
+    pub fn manifests(&self) -> Result<Vec<SegmentManifest>, StorageError> {
+        let mut manifests = self
+            .segment_ids()?
+            .into_iter()
+            .map(|segment_id| self.read_segment_manifest(segment_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        manifests.sort_by_key(|manifest| manifest.segment_id);
+        Ok(manifests)
+    }
+
+    pub fn archive_compacted_segments(&self, up_to_sequence: u64) -> Result<usize, StorageError> {
+        let Some(archive_dir) = &self.options.archive_dir else {
+            return Ok(0);
+        };
+        fs::create_dir_all(archive_dir).map_err(|error| StorageError::Io(error.to_string()))?;
+        let mut archived = 0_usize;
+        for manifest in self.manifests()? {
+            if manifest.last_sequence > up_to_sequence {
+                continue;
+            }
+            let wal_path = self.segment_path(manifest.segment_id);
+            let manifest_path = self.segment_manifest_path(manifest.segment_id);
+            fs::rename(
+                &wal_path,
+                archive_dir.join(segment_wal_file_name(manifest.segment_id)),
+            )
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+            fs::rename(
+                &manifest_path,
+                archive_dir.join(segment_manifest_file_name(manifest.segment_id)),
+            )
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+            archived += 1;
+        }
+        Ok(archived)
+    }
+
+    pub fn recover_quarantine_corrupt_segments(
+        &self,
+    ) -> Result<SegmentedWalRecoveryReport, StorageError> {
+        let Some(quarantine_dir) = &self.options.quarantine_dir else {
+            return Ok(SegmentedWalRecoveryReport {
+                records_recovered: self.read_records()?.len() as u64,
+                last_good_sequence: self.last_sequence()?,
+                segments_quarantined: 0,
+                bytes_quarantined: 0,
+                corruption_reason: None,
+            });
+        };
+        fs::create_dir_all(quarantine_dir).map_err(|error| StorageError::Io(error.to_string()))?;
+        let mut segments_quarantined = 0_usize;
+        let mut bytes_quarantined = 0_u64;
+        let mut corruption_reason = None;
+        for segment_id in self.segment_ids()? {
+            let manifest = match self.read_segment_manifest(segment_id) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    corruption_reason = Some(format!("{error:?}"));
+                    let (segments, bytes) = self.quarantine_segment(segment_id, quarantine_dir)?;
+                    segments_quarantined += segments;
+                    bytes_quarantined += bytes;
+                    continue;
+                }
+            };
+            if let Err(error) = self.read_segment_records_with_manifest(&manifest) {
+                corruption_reason = Some(format!("{error:?}"));
+                let (segments, bytes) = self.quarantine_segment(segment_id, quarantine_dir)?;
+                segments_quarantined += segments;
+                bytes_quarantined += bytes;
+            }
+        }
+        let records = self.read_records().unwrap_or_default();
+        Ok(SegmentedWalRecoveryReport {
+            records_recovered: records.len() as u64,
+            last_good_sequence: records.last().map(|record| record.sequence),
+            segments_quarantined,
+            bytes_quarantined,
+            corruption_reason,
+        })
+    }
+
+    pub fn restore_snapshot_and_tail(
+        snapshot_path: impl AsRef<Path>,
+        wal: &SegmentedWal,
+    ) -> Result<InMemoryStorage, StorageError> {
+        let manifest = SnapshotReader::manifest(&snapshot_path)?;
+        let mut storage = SnapshotReader::read(snapshot_path)?;
+        let boundary = manifest
+            .wal_lsn_boundary
+            .unwrap_or(manifest.event_count as u64);
+        for record in wal.read_tail_after(boundary)? {
+            storage.append_event(record.event)?;
+        }
+        Ok(storage)
+    }
+
+    fn active_segment_id(&self) -> Result<u64, StorageError> {
+        let manifests = self.manifests()?;
+        let Some(last) = manifests.last() else {
+            return Ok(1);
+        };
+        if last.event_count >= self.options.max_segment_events {
+            Ok(last.segment_id + 1)
+        } else {
+            Ok(last.segment_id)
+        }
+    }
+
+    fn next_sequence(&self) -> Result<u64, StorageError> {
+        Ok(self.last_sequence()?.unwrap_or(0) + 1)
+    }
+
+    fn last_sequence(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self
+            .manifests()?
+            .last()
+            .map(|manifest| manifest.last_sequence))
+    }
+
+    fn segment_path(&self, segment_id: u64) -> PathBuf {
+        self.dir.join(segment_wal_file_name(segment_id))
+    }
+
+    fn segment_manifest_path(&self, segment_id: u64) -> PathBuf {
+        self.dir.join(segment_manifest_file_name(segment_id))
+    }
+
+    fn segment_ids(&self) -> Result<Vec<u64>, StorageError> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&self.dir).map_err(|error| StorageError::Io(error.to_string()))? {
+            let entry = entry.map_err(|error| StorageError::Io(error.to_string()))?;
+            if let Some(segment_id) = parse_segment_wal_file_name(&entry.path()) {
+                ids.push(segment_id);
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    fn read_segment_manifest(&self, segment_id: u64) -> Result<SegmentManifest, StorageError> {
+        let encoded = fs::read_to_string(self.segment_manifest_path(segment_id))
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        decode_segment_manifest(encoded.trim_end())
+    }
+
+    fn read_segment_records_with_manifest(
+        &self,
+        manifest: &SegmentManifest,
+    ) -> Result<Vec<WalRecord>, StorageError> {
+        let records = read_wal_records_from_path(
+            self.segment_path(manifest.segment_id),
+            manifest.first_sequence,
+        )?;
+        let actual = SegmentManifest::from_records(manifest.segment_id, &records)?;
+        if &actual != manifest {
+            return Err(StorageError::Codec(format!(
+                "segment manifest mismatch for segment {}",
+                manifest.segment_id
+            )));
+        }
+        Ok(records)
+    }
+
+    fn rewrite_segment_manifest(&self, segment_id: u64) -> Result<(), StorageError> {
+        let first_sequence = self
+            .read_segment_manifest(segment_id)
+            .ok()
+            .map(|manifest| manifest.first_sequence)
+            .or_else(|| {
+                self.previous_segment_manifest(segment_id)
+                    .map(|manifest| manifest.last_sequence + 1)
+            })
+            .unwrap_or(1);
+        let records = read_wal_records_from_path(self.segment_path(segment_id), first_sequence)?;
+        let manifest = SegmentManifest::from_records(segment_id, &records)?;
+        let path = self.segment_manifest_path(segment_id);
+        let tmp_path = path.with_extension("manifest.tmp");
+        fs::write(
+            &tmp_path,
+            format!("{}\n", encode_segment_manifest(&manifest)),
+        )
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+        fs::rename(&tmp_path, &path).map_err(|error| StorageError::Io(error.to_string()))?;
+        Ok(())
+    }
+
+    fn quarantine_segment(
+        &self,
+        segment_id: u64,
+        quarantine_dir: &Path,
+    ) -> Result<(usize, u64), StorageError> {
+        let mut moved = 0_usize;
+        let mut bytes = 0_u64;
+        for path in [
+            self.segment_path(segment_id),
+            self.segment_manifest_path(segment_id),
+        ] {
+            if !path.exists() {
+                continue;
+            }
+            bytes += fs::metadata(&path)
+                .map_err(|error| StorageError::Io(error.to_string()))?
+                .len();
+            let target = quarantine_dir.join(
+                path.file_name()
+                    .ok_or_else(|| StorageError::Codec("missing segment filename".to_owned()))?,
+            );
+            if target.exists() {
+                fs::remove_file(&target).map_err(|error| StorageError::Io(error.to_string()))?;
+            }
+            fs::rename(&path, target).map_err(|error| StorageError::Io(error.to_string()))?;
+            moved += 1;
+        }
+        Ok(((moved > 0) as usize, bytes))
+    }
+
+    fn previous_segment_manifest(&self, segment_id: u64) -> Option<SegmentManifest> {
+        self.segment_ids()
+            .ok()?
+            .into_iter()
+            .filter(|candidate| *candidate < segment_id)
+            .filter_map(|candidate| self.read_segment_manifest(candidate).ok())
+            .max_by_key(|manifest| manifest.segment_id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentManifest {
+    pub schema_version: u32,
+    pub segment_id: u64,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub event_count: usize,
+    pub event_checksum: String,
+}
+
+impl SegmentManifest {
+    fn from_records(segment_id: u64, records: &[WalRecord]) -> Result<Self, StorageError> {
+        let first_sequence = records
+            .first()
+            .ok_or_else(|| StorageError::Codec("empty WAL segment".to_owned()))?
+            .sequence;
+        let last_sequence = records
+            .last()
+            .ok_or_else(|| StorageError::Codec("empty WAL segment".to_owned()))?
+            .sequence;
+        Ok(Self {
+            schema_version: 1,
+            segment_id,
+            first_sequence,
+            last_sequence,
+            event_count: records.len(),
+            event_checksum: checksum_wal_records(records),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentedWalRecoveryReport {
+    pub records_recovered: u64,
+    pub last_good_sequence: Option<u64>,
+    pub segments_quarantined: usize,
+    pub bytes_quarantined: u64,
+    pub corruption_reason: Option<String>,
+}
+
+fn segment_wal_file_name(segment_id: u64) -> String {
+    format!("segment-{segment_id:020}.wal")
+}
+
+fn segment_manifest_file_name(segment_id: u64) -> String {
+    format!("segment-{segment_id:020}.manifest")
+}
+
+fn parse_segment_wal_file_name(path: &Path) -> Option<u64> {
+    let filename = path.file_name()?.to_str()?;
+    let id = filename.strip_prefix("segment-")?.strip_suffix(".wal")?;
+    id.parse::<u64>().ok()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -777,6 +1190,48 @@ fn encode_backup_manifest(manifest: &BackupManifest) -> String {
     ])
 }
 
+fn encode_segment_manifest(manifest: &SegmentManifest) -> String {
+    encode_parts(&[
+        "segment_manifest".to_owned(),
+        "schema_version".to_owned(),
+        manifest.schema_version.to_string(),
+        "segment_id".to_owned(),
+        manifest.segment_id.to_string(),
+        "first_sequence".to_owned(),
+        manifest.first_sequence.to_string(),
+        "last_sequence".to_owned(),
+        manifest.last_sequence.to_string(),
+        "event_count".to_owned(),
+        manifest.event_count.to_string(),
+        "event_checksum".to_owned(),
+        manifest.event_checksum.clone(),
+    ])
+}
+
+fn decode_segment_manifest(record: &str) -> Result<SegmentManifest, StorageError> {
+    let parts = decode_parts(record)?;
+    if required(&parts, 0, "segment manifest kind")? != "segment_manifest"
+        || required(&parts, 1, "schema version key")? != "schema_version"
+        || required(&parts, 3, "segment id key")? != "segment_id"
+        || required(&parts, 5, "first sequence key")? != "first_sequence"
+        || required(&parts, 7, "last sequence key")? != "last_sequence"
+        || required(&parts, 9, "event count key")? != "event_count"
+        || required(&parts, 11, "event checksum key")? != "event_checksum"
+    {
+        return Err(StorageError::Codec(
+            "invalid segment manifest fields".to_owned(),
+        ));
+    }
+    Ok(SegmentManifest {
+        schema_version: parse_u32(required(&parts, 2, "schema version")?)?,
+        segment_id: parse_u64(required(&parts, 4, "segment id")?)?,
+        first_sequence: parse_u64(required(&parts, 6, "first sequence")?)?,
+        last_sequence: parse_u64(required(&parts, 8, "last sequence")?)?,
+        event_count: parse_usize(required(&parts, 10, "event count")?)?,
+        event_checksum: required(&parts, 12, "event checksum")?.to_owned(),
+    })
+}
+
 fn encode_snapshot_manifest(manifest: &SnapshotManifest) -> String {
     encode_parts(&[
         "snapshot_manifest".to_owned(),
@@ -995,19 +1450,61 @@ fn checksum_events(events: &[GraphEvent]) -> String {
     checksum_hex(&bytes)
 }
 
+fn checksum_wal_records(records: &[WalRecord]) -> String {
+    let mut bytes = Vec::new();
+    for record in records {
+        bytes.extend_from_slice(record.sequence.to_string().as_bytes());
+        bytes.push(b':');
+        bytes.extend_from_slice(record.checksum.as_bytes());
+        bytes.push(b'\n');
+    }
+    checksum_hex(&bytes)
+}
+
 pub fn deterministic_state_hash(storage: &InMemoryStorage) -> String {
-    checksum_hex(
-        format!(
-            "events={};entities={};assertions={};sources={};memories={};checksum={}",
-            storage.events().len(),
-            storage.graph_state().entities.len(),
-            storage.graph_state().assertions.len(),
-            storage.graph_state().sources.len(),
-            storage.graph_state().agent_memories.len(),
-            checksum_events(storage.events())
-        )
-        .as_bytes(),
-    )
+    let state = storage.graph_state();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"events\n");
+    for event in storage.events() {
+        bytes.extend_from_slice(encode_event(event).as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"entities\n");
+    for (id, entity) in &state.entities {
+        bytes.extend_from_slice(id.as_str().as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(encode_entity(entity).as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"assertions\n");
+    for (id, assertion) in &state.assertions {
+        bytes.extend_from_slice(id.as_str().as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(encode_assertion(assertion).as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"sources\n");
+    for (id, source) in &state.sources {
+        bytes.extend_from_slice(id.as_str().as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(encode_source(source).as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"memories\n");
+    for (id, memory) in &state.agent_memories {
+        bytes.extend_from_slice(id.as_str().as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(encode_agent_memory(memory).as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(b"causal_links\n");
+    for (id, causal_link) in &state.causal_links {
+        bytes.extend_from_slice(id.as_str().as_bytes());
+        bytes.push(b'=');
+        bytes.extend_from_slice(encode_causal_link(causal_link).as_bytes());
+        bytes.push(b'\n');
+    }
+    checksum_hex(&bytes)
 }
 
 fn checksum_hex(bytes: &[u8]) -> String {
@@ -1753,6 +2250,7 @@ mod tests {
     };
     use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_file(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -1762,6 +2260,21 @@ mod tests {
             TxTime::new(0).as_i64()
         ));
         let _ = fs::remove_file(&path);
+        path
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        path.push(format!(
+            "reality-graph-storage-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp dir");
         path
     }
 
@@ -1988,6 +2501,169 @@ mod tests {
         ));
 
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn segmented_wal_rotates_segments_and_writes_manifests() {
+        let dir = temp_dir("segmented-rotate");
+        let events = sample_events();
+        let mut wal = SegmentedWal::open(&dir, SegmentedWalOptions::new(2)).expect("open wal");
+
+        for event in &events {
+            wal.append(event).expect("append event");
+        }
+
+        let records = wal.read_records().expect("read segmented records");
+        let manifests = wal.manifests().expect("read manifests");
+
+        assert_eq!(records.len(), events.len());
+        assert_eq!(records[0].sequence, 1);
+        assert_eq!(records[3].sequence, 4);
+        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests[0].segment_id, 1);
+        assert_eq!(manifests[0].first_sequence, 1);
+        assert_eq!(manifests[0].last_sequence, 2);
+        assert_eq!(manifests[0].event_count, 2);
+        assert_eq!(manifests[1].first_sequence, 3);
+        assert_eq!(manifests[1].last_sequence, 4);
+        assert!(dir.join(segment_manifest_file_name(1)).exists());
+        assert!(dir.join(segment_manifest_file_name(2)).exists());
+
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn segmented_wal_rejects_reordered_segments() {
+        let dir = temp_dir("segmented-reordered");
+        let events = sample_events();
+        let mut wal = SegmentedWal::open(&dir, SegmentedWalOptions::new(2)).expect("open wal");
+        for event in &events {
+            wal.append(event).expect("append event");
+        }
+
+        let first_wal = dir.join(segment_wal_file_name(1));
+        let second_wal = dir.join(segment_wal_file_name(2));
+        let first_manifest = dir.join(segment_manifest_file_name(1));
+        let second_manifest = dir.join(segment_manifest_file_name(2));
+        let tmp_wal = dir.join("segment-swap.wal");
+        let tmp_manifest = dir.join("segment-swap.manifest");
+        fs::rename(&first_wal, &tmp_wal).expect("move first wal");
+        fs::rename(&second_wal, &first_wal).expect("move second wal");
+        fs::rename(&tmp_wal, &second_wal).expect("move first wal into second slot");
+        fs::rename(&first_manifest, &tmp_manifest).expect("move first manifest");
+        fs::rename(&second_manifest, &first_manifest).expect("move second manifest");
+        fs::rename(&tmp_manifest, &second_manifest).expect("move first manifest into second slot");
+
+        let reloaded = SegmentedWal::open(&dir, SegmentedWalOptions::new(2)).expect("reopen wal");
+        assert!(matches!(
+            reloaded.read_records(),
+            Err(StorageError::Codec(message))
+                if message.contains("manifest mismatch") || message.contains("sequence")
+        ));
+
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn segmented_wal_archives_compacted_segments_and_reads_tail() {
+        let dir = temp_dir("segmented-archive");
+        let archive_dir = dir.join("archive");
+        let events = sample_events();
+        let mut wal = SegmentedWal::open(
+            &dir,
+            SegmentedWalOptions::new(2).with_archive_dir(&archive_dir),
+        )
+        .expect("open wal");
+        for event in &events {
+            wal.append(event).expect("append event");
+        }
+
+        let archived = wal
+            .archive_compacted_segments(2)
+            .expect("archive compacted segment");
+        let tail = wal.read_tail_after(2).expect("read tail");
+
+        assert_eq!(archived, 1);
+        assert!(!dir.join(segment_wal_file_name(1)).exists());
+        assert!(archive_dir.join(segment_wal_file_name(1)).exists());
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].sequence, 3);
+        assert_eq!(tail[1].sequence, 4);
+
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn segmented_wal_restores_snapshot_plus_wal_tail() {
+        let dir = temp_dir("segmented-tail-restore");
+        let snapshot_path = dir.join("snapshot.rgsnap");
+        let events = sample_events();
+        let mut wal = SegmentedWal::open(&dir, SegmentedWalOptions::new(2)).expect("open wal");
+        for event in &events {
+            wal.append(event).expect("append event");
+        }
+        let snapshot_storage = InMemoryStorage::replay(&events[..2]).expect("snapshot replay");
+        SnapshotWriter::write_atomic(&snapshot_path, &snapshot_storage).expect("write snapshot");
+        let expected = InMemoryStorage::replay(&events).expect("full replay");
+
+        let restored = SegmentedWal::restore_snapshot_and_tail(&snapshot_path, &wal)
+            .expect("restore snapshot plus tail");
+
+        assert_eq!(restored.events(), expected.events());
+        assert_eq!(restored.graph_state(), expected.graph_state());
+        assert_eq!(
+            deterministic_state_hash(&restored),
+            deterministic_state_hash(&expected)
+        );
+
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn segmented_wal_quarantines_corrupt_segment() {
+        let dir = temp_dir("segmented-quarantine");
+        let quarantine_dir = dir.join("quarantine");
+        let events = sample_events();
+        let mut wal = SegmentedWal::open(
+            &dir,
+            SegmentedWalOptions::new(2).with_quarantine_dir(&quarantine_dir),
+        )
+        .expect("open wal");
+        for event in &events {
+            wal.append(event).expect("append event");
+        }
+        let second_segment = dir.join(segment_wal_file_name(2));
+        let mut contents = fs::read_to_string(&second_segment).expect("read segment");
+        contents.push_str("RGEVENT|5|partial");
+        fs::write(&second_segment, contents).expect("corrupt segment");
+
+        let report = wal
+            .recover_quarantine_corrupt_segments()
+            .expect("recover corrupt segment");
+
+        assert_eq!(report.segments_quarantined, 1);
+        assert!(report.bytes_quarantined > 0);
+        assert!(report.corruption_reason.is_some());
+        assert!(quarantine_dir.join(segment_wal_file_name(2)).exists());
+        assert_eq!(wal.read_records().expect("read remaining records").len(), 2);
+
+        fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn deterministic_state_hash_changes_when_materialized_content_changes() {
+        let first_events = sample_events();
+        let mut second_events = sample_events();
+        if let GraphEvent::EntityCreated(event) = &mut second_events[1] {
+            event.entity.canonical_name = Some("Person A Renamed".to_owned());
+        }
+        let first = InMemoryStorage::replay(&first_events).expect("first replay");
+        let second = InMemoryStorage::replay(&second_events).expect("second replay");
+
+        assert_ne!(
+            deterministic_state_hash(&first),
+            deterministic_state_hash(&second)
+        );
     }
 
     #[test]

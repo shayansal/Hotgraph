@@ -1,0 +1,64 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: reality-graph-default-deny-ingress
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: reality-graph-network-policy
+    app.kubernetes.io/part-of: reality-graph
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: reality-graph-allow-api-ingress
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: reality-graph-api-network-policy
+    app.kubernetes.io/part-of: reality-graph
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: reality-graph-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: reality-graph
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: reality-graph-allow-observability-ingress
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: reality-graph-observability-network-policy
+    app.kubernetes.io/part-of: reality-graph
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - prometheus
+          - grafana
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: reality-graph
+      ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 3000

@@ -1733,12 +1733,14 @@ pub struct MetricsResponse {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub struct ErrorResponse {
+    pub code: String,
     pub error: String,
 }
 
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
+    code: &'static str,
     message: String,
 }
 
@@ -1746,6 +1748,7 @@ impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
             message: message.into(),
         }
     }
@@ -1753,6 +1756,7 @@ impl ApiError {
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
             message: message.into(),
         }
     }
@@ -1760,6 +1764,7 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            code: "forbidden",
             message: message.into(),
         }
     }
@@ -1767,6 +1772,7 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            code: "conflict",
             message: message.into(),
         }
     }
@@ -1774,6 +1780,7 @@ impl ApiError {
     fn request_timeout(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::REQUEST_TIMEOUT,
+            code: "request_timeout",
             message: message.into(),
         }
     }
@@ -1781,6 +1788,7 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            code: "not_found",
             message: message.into(),
         }
     }
@@ -1788,6 +1796,7 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
             message: message.into(),
         }
     }
@@ -1798,6 +1807,7 @@ impl IntoResponse for ApiError {
         (
             self.status,
             Json(ErrorResponse {
+                code: self.code.to_owned(),
                 error: self.message,
             }),
         )

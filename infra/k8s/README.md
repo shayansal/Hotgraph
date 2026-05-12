@@ -8,6 +8,9 @@ These manifests define a production-shaped starter deployment:
 - `object-storage` StatefulSet backed by MinIO
 - Prometheus Deployment
 - Grafana Deployment
+- API backup PVC and scheduled backup CronJob
+- default-deny ingress NetworkPolicy with explicit internal allows
+- PodDisruptionBudgets for API and Qdrant
 - ClusterIP Services and an optional NGINX Ingress
 
 The API uses a single file-backed event log PVC in this starter manifest, so the API Deployment is pinned to one replica. Move `RG_EVENT_LOG_PATH` to a shared production log service before scaling API replicas horizontally. The worker currently runs the same `rg-api` image on port `8081` and exposes the same health/metrics endpoints. Replace its command/image when a dedicated ingestion worker binary is added.
@@ -66,3 +69,23 @@ Health endpoints:
 - Worker health: `/v1/health` on port `8081`
 - Prometheus: `/-/healthy`
 - Grafana: `/api/health`
+
+## Backups And Restore
+
+`backup-cronjob.yaml` copies the API WAL and idempotency log from the API PVC
+to `reality-graph-api-backups` every 15 minutes and writes SHA-256 sums beside
+each backup. This is a starter cluster-local backup only; production deployments
+must mirror these artifacts to object storage or a managed backup service.
+
+Restore is intentionally manual:
+
+1. Scale `deployment/reality-graph-api` to zero.
+2. Choose a backup directory from `reality-graph-api-backups`.
+3. Restore `events.log` and `idempotency.log` into `reality-graph-api-data`.
+4. Start a one-shot restore verification job or run the API locally against the
+   restored PVC.
+5. Compare state hash, event checksum, and post-restore query parity.
+6. Scale the API back to one replica.
+
+Do not run a restore job against a live writer. File-backed mode is single-node
+only until a shared durable log or leader/follower design is implemented.

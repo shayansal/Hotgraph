@@ -219,6 +219,7 @@ async fn auth_middleware_enforces_api_keys_roles_and_masks_secrets() {
     .await;
     assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     let denied_body = response_json(denied).await;
+    assert_eq!(denied_body["code"], "unauthorized");
     assert!(!denied_body["error"]
         .as_str()
         .expect("error string")
@@ -237,6 +238,8 @@ async fn auth_middleware_enforces_api_keys_roles_and_masks_secrets() {
     )
     .await;
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    let forbidden_body = response_json(forbidden).await;
+    assert_eq!(forbidden_body["code"], "forbidden");
 
     let health = request_empty(app, "GET", "/v1/health").await;
     assert_eq!(health["status"], "ok");

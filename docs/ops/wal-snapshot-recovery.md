@@ -25,6 +25,31 @@ Fields:
 Legacy v1 records without sequence metadata remain readable for local upgrade
 compatibility, but production writes must use the v2 format.
 
+## Segmented WAL
+
+`SegmentedWal` is the production-shaped WAL path. It stores records in files
+named:
+
+```text
+segment-00000000000000000001.wal
+segment-00000000000000000001.manifest
+```
+
+Each segment manifest includes:
+
+- schema version
+- segment ID
+- first sequence
+- last sequence
+- event count
+- checksum over records in the segment
+
+Segment manifests are published atomically after append. Readers verify every
+manifest before replay and reject reordered, missing, duplicated, or corrupted
+segments. Compaction may archive complete segments whose sequences are covered
+by a verified snapshot. Recovery can quarantine a corrupt segment into a
+dedicated directory without silently replaying unverified data.
+
 ## Fsync Policy
 
 `WalOptions` supports:
@@ -72,6 +97,7 @@ Restoring from a snapshot or backup must satisfy:
 - deterministic graph-state hash equality
 - query parity over entities, assertions, and sources
 - bitemporal query semantics unchanged after replay
+- snapshot WAL LSN boundary plus segmented WAL tail reaches the same state as
+  full replay
 
 Any mismatch is a failed restore, not a warning.
-

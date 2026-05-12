@@ -1,0 +1,27 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: reality-graph-api-pdb
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: reality-graph-api
+    app.kubernetes.io/part-of: reality-graph
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reality-graph-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: qdrant-pdb
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: qdrant
+    app.kubernetes.io/part-of: reality-graph
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qdrant

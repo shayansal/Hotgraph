@@ -5,6 +5,7 @@ resources:
   - namespace.yaml
   - configmap.yaml
   - api-pvc.yaml
+  - api-backup-pvc.yaml
   - api-deployment.yaml
   - worker-deployment.yaml
   - qdrant-statefulset.yaml
@@ -13,3 +14,6 @@ resources:
   - grafana.yaml
   - service.yaml
   - ingress.yaml
+  - backup-cronjob.yaml
+  - network-policy.yaml
+  - pdb.yaml
