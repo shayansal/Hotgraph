@@ -330,6 +330,18 @@ impl<P: KmsProvider> EnvelopeEncryptor<P> {
         Self { kms }
     }
 
+    pub fn new_production(kms: P) -> Result<Self, ConfidentialError> {
+        let metadata = kms.key_metadata();
+        if metadata.provider == "local-dev" {
+            return Err(ConfidentialError::Codec(
+                "LocalDevKmsProvider is dev/test-only and cannot protect production data"
+                    .to_owned(),
+            ));
+        }
+        kms.health_check()?;
+        Ok(Self { kms })
+    }
+
     pub fn encrypt(
         &self,
         tenant_id: &str,

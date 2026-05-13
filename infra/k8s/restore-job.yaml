@@ -1,0 +1,68 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reality-graph-restore
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: reality-graph-restore
+    app.kubernetes.io/part-of: reality-graph
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reality-graph-restore
+        app.kubernetes.io/part-of: reality-graph
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore
+          image: registry.example.com/reality-graph-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - |
+              test "${HOTGRAPH_RESTORE_CONFIRM:-}" = "restore-to-clean-pvc"
+              test -n "${HOTGRAPH_RESTORE_BACKUP:-}"
+              test ! -f /restore/hotgraph.redb
+              hotgraph restore --input "/backup/${HOTGRAPH_RESTORE_BACKUP}/hotgraph.backup" --target /restore
+              hotgraph restore verify --input "/backup/${HOTGRAPH_RESTORE_BACKUP}/hotgraph.backup" > /restore/RESTORE_VERIFY.txt
+          env:
+            - name: HOTGRAPH_RESTORE_CONFIRM
+              value: ""
+            - name: HOTGRAPH_RESTORE_BACKUP
+              value: ""
+          volumeMounts:
+            - name: api-backups
+              mountPath: /backup
+              readOnly: true
+            - name: restore-target
+              mountPath: /restore
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: api-backups
+          persistentVolumeClaim:
+            claimName: reality-graph-api-backups
+        - name: restore-target
+          persistentVolumeClaim:
+            claimName: reality-graph-api-restore-target

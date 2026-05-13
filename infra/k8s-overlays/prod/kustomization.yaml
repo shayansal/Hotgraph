@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../k8s
+
+configMapGenerator:
+  - name: hotgraph-environment
+    behavior: create
+    literals:
+      - HOTGRAPH_ENVIRONMENT=prod
+      - HOTGRAPH_PRODUCTION_CLAIM=false
+      - HOTGRAPH_WRITER_REPLICAS=1
+
+images:
+  - name: registry.example.com/reality-graph-api
+    newName: registry.example.com/reality-graph-api
+    newTag: 0.1.0

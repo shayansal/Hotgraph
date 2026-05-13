@@ -16,6 +16,10 @@ For every production candidate, create `docs/ops/releases/<version>.md` with:
 - incident drill report location
 - known limitations and accepted risk owners
 
+Use `docs/ops/releases/TEMPLATE.md` as the starting point. The default decision
+for every gate is `fail`; release managers must replace each row with dated
+evidence before claiming production readiness.
+
 Pass: all linked artifacts exist and match the candidate commit.
 
 Fail: any artifact is missing, from another commit, or not reproducible.
@@ -146,4 +150,3 @@ operator burden and cost profile are documented.
 
 Fail: no pilot, unclosed critical/high issue, or user-visible correctness issue
 without an accepted mitigation.
-

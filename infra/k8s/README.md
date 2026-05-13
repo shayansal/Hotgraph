@@ -9,6 +9,7 @@ These manifests define a production-shaped starter deployment:
 - Prometheus Deployment
 - Grafana Deployment
 - API backup PVC and scheduled backup CronJob
+- manual restore and migration-check Job templates
 - default-deny ingress NetworkPolicy with explicit internal allows
 - PodDisruptionBudgets for API and Qdrant
 - ClusterIP Services and an optional NGINX Ingress
@@ -51,6 +52,18 @@ kubectl -n reality-graph create secret generic reality-graph-secrets \
 kubectl apply -k infra/k8s/
 ```
 
+Environment overlays are available for explicit deployment lanes:
+
+```bash
+kubectl apply -k infra/k8s-overlays/dev
+kubectl apply -k infra/k8s-overlays/staging
+kubectl apply -k infra/k8s-overlays/prod
+```
+
+The prod overlay still sets `HOTGRAPH_PRODUCTION_CLAIM=false`. Flip that only
+after the release record links passing crash, restore, security, benchmark, and
+pilot evidence for the exact commit and image digest.
+
 Check rollout and health:
 
 ```bash
@@ -78,20 +91,27 @@ Health endpoints:
 
 ## Backups And Restore
 
-`backup-cronjob.yaml` copies the API redb database, WAL, and idempotency log from the API PVC
-to `reality-graph-api-backups` every 15 minutes and writes SHA-256 sums beside
-each backup. This is a starter cluster-local backup only; production deployments
-must mirror these artifacts to object storage or a managed backup service.
+`backup-cronjob.yaml` runs `hotgraph backup create` against `/data/hotgraph.redb`
+every 15 minutes, verifies the artifact with `hotgraph backup verify`, and writes
+SHA-256 sums beside the backup. This is a starter cluster-local backup only;
+production deployments must mirror these artifacts to object storage or a
+managed backup service.
 
 Restore is intentionally manual:
 
 1. Scale `deployment/reality-graph-api` to zero.
 2. Choose a backup directory from `reality-graph-api-backups`.
-3. Restore `hotgraph.redb`, `events.log`, and `idempotency.log` into `reality-graph-api-data`.
-4. Start a one-shot restore verification job or run the API locally against the
-   restored PVC.
-5. Compare state hash, event checksum, and post-restore query parity.
-6. Scale the API back to one replica.
+3. Create or bind a clean PVC named `reality-graph-api-restore-target`.
+4. Set `HOTGRAPH_RESTORE_BACKUP` in `restore-job.yaml` to the chosen backup
+   directory and set `HOTGRAPH_RESTORE_CONFIRM=restore-to-clean-pvc`.
+5. Apply `restore-pvc.yaml` and `restore-job.yaml`.
+6. Compare `RESTORE_VERIFY.txt`, state hash, event checksum, and query parity.
+7. Promote the restored PVC only after verification, then scale the API back to
+   one replica.
 
 Do not run a restore job against a live writer. File-backed mode is single-node
 only until a shared durable log or leader/follower design is implemented.
+
+Before a migration or upgrade, run `migration-job.yaml` against the writer PVC.
+It creates and verifies a pre-migration backup artifact from the existing redb
+store. It is a guardrail, not a replacement for schema migration tests.

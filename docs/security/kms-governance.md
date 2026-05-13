@@ -20,7 +20,8 @@ Implemented boundary:
 - `EnvelopeEncryptor` uses `XChaCha20Poly1305` with authenticated associated
   data and encrypted data keys.
 - `LocalDevKmsProvider` is deterministic and intended only for tests,
-  development, and reproducible fixtures.
+  development, and reproducible fixtures. `EnvelopeEncryptor::new_production`
+  rejects it.
 - `AwsKmsProvider` reserves the production adapter surface behind the
   `aws-kms` feature; hosted production still requires wiring the AWS SDK,
   workload identity/IAM policy, and deployment-time health checks.

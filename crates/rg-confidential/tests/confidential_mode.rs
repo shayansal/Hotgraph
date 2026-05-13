@@ -99,6 +99,16 @@ fn envelope_encryptor_detects_tamper_wrong_key_and_wrong_associated_data() {
 }
 
 #[test]
+fn production_envelope_encryptor_rejects_local_development_kms() {
+    let error = EnvelopeEncryptor::new_production(LocalDevKmsProvider::new("dev-master"))
+        .expect_err("local development KMS must not be accepted in production mode");
+
+    assert!(
+        matches!(error, rg_confidential::ConfidentialError::Codec(message) if message.contains("LocalDevKmsProvider"))
+    );
+}
+
+#[test]
 fn key_rotation_reencrypts_existing_event_records_with_active_key() {
     let path = temp_file("rotation-log");
     let old_key = TenantKey::new(KeyId::new("key-old"), [1; 32]);

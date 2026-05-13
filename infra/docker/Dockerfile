@@ -23,6 +23,7 @@ RUN groupadd --system --gid 10001 realitygraph \
     && chown -R realitygraph:realitygraph /var/lib/reality-graph
 
 COPY --from=builder /workspace/target/release/rg-api /usr/local/bin/rg-api
+COPY --from=builder /workspace/target/release/hotgraph /usr/local/bin/hotgraph
 
 ENV RG_API_ADDR=0.0.0.0:8080
 ENV HOTGRAPH_NODE_ROLE=writer

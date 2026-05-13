@@ -62,6 +62,23 @@ jobs:
       - name: Audit Cargo dependencies
         run: cargo audit --deny warnings
 
+  rust-deny:
+    name: Rust license and supply-chain policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Check dependency policy
+        run: cargo deny check
+
   benchmarks:
     name: Benchmark smoke gate
     runs-on: ubuntu-latest
@@ -153,3 +170,37 @@ jobs:
 
       - name: Build API image
         run: docker build -f infra/docker/Dockerfile -t reality-graph-api:ci .
+
+  kubernetes:
+    name: Kubernetes manifest validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.0
+
+      - name: Render base manifests
+        run: kubectl kustomize infra/k8s > /tmp/reality-graph-k8s.yaml
+
+      - name: Render deployment overlays
+        run: |
+          kubectl kustomize infra/k8s-overlays/dev > /tmp/reality-graph-dev.yaml
+          kubectl kustomize infra/k8s-overlays/staging > /tmp/reality-graph-staging.yaml
+          kubectl kustomize infra/k8s-overlays/prod > /tmp/reality-graph-prod.yaml
+
+      - name: Validate restore and migration job templates are parseable
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          for path in [
+              "infra/k8s/restore-pvc.yaml",
+              "infra/k8s/restore-job.yaml",
+              "infra/k8s/migration-job.yaml",
+          ]:
+              text = Path(path).read_text()
+              assert "apiVersion:" in text, f"{path} missing apiVersion"
+              assert "kind:" in text, f"{path} missing kind"
+              assert "metadata:" in text, f"{path} missing metadata"
+          PY

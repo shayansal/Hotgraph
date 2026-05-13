@@ -81,8 +81,9 @@ Required evidence:
 - Key rotation and wrong-key/tamper test artifact.
 - Threat model and penetration test report with no open critical/high findings.
 
-Current status: failing until governance is wired through every read path and
-AEAD/KMS replaces test crypto.
+Current status: failing until governance is wired through every read path and a
+real hosted KMS adapter is proven. AEAD record/envelope encryption exists, and
+production construction rejects the local development KMS provider.
 
 ## 5. Operability
 

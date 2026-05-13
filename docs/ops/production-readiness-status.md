@@ -27,13 +27,20 @@ gates so the project does not drift from evidence-backed readiness.
 - Redb-backed graph queries can read materialized assertion rows through durable
   subject, predicate, object, source, valid-time, transaction-time, and context
   indexes instead of replaying an in-memory graph for every query.
+- A `hotgraph` operational CLI can create and verify backup artifacts from a
+  redb store, restore into a clean redb target directory, and verify restored
+  state hash/query parity.
 - API node-role configuration exists for writer and reader modes. Reader mode
   requires `HOTGRAPH_WRITER_URL` and rejects local writes with a stable
   `writer_required` error until writer proxying and follower tailing are wired.
+- Redb follower catch-up can replay committed leader LSNs into a follower store
+  and rejects divergent existing LSNs.
 - Confidential mode uses `XChaCha20Poly1305` AEAD for record/envelope
   encryption, includes authenticated associated data, and has tests for
   tamper, wrong-key, wrong-purpose, source-store, event-log, snapshot, and key
   rotation behavior.
+- Production envelope construction rejects the deterministic local development
+  KMS provider.
 
 ## Blocking Evidence Still Required
 
@@ -45,11 +52,12 @@ gates so the project does not drift from evidence-backed readiness.
 - The KMS trait and AWS KMS adapter boundary exist, but the repository does not
   yet call the AWS SDK or prove hosted workload identity/IAM behavior.
 - The redb backend is implemented as v0.1, but it still needs process-level
-  crash testing, backup/restore automation, full API query-path coverage, and
-  scale evidence before it can be called production-ready.
-- Multi-replica API mode has a node-role boundary, but follower tailing,
-  write-proxying, stale-reader rejection, lease-expiry failover, and
-  split-brain prevention are still blocking evidence items.
+  crash testing, full API query-path coverage, and scale evidence before it can
+  be called production-ready.
+- Multi-replica API mode has a node-role boundary and storage-level catch-up,
+  but network follower tailing, write-proxying, stale-reader rejection,
+  lease-expiry failover, and split-brain prevention are still blocking evidence
+  items.
 - 10M, 50M, and 100M benchmark artifacts have not been produced.
 - Penetration test, monthly restore drill, dirty-data pilot, and adversarial
   real-data pilot require external operational evidence.

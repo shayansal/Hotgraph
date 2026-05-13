@@ -6,6 +6,7 @@ resources:
   - configmap.yaml
   - api-pvc.yaml
   - api-backup-pvc.yaml
+  - restore-pvc.yaml
   - api-deployment.yaml
   - worker-deployment.yaml
   - qdrant-statefulset.yaml

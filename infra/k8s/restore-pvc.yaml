@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: reality-graph-api-restore-target
+  namespace: reality-graph
+  labels:
+    app.kubernetes.io/name: reality-graph-api-restore-target
+    app.kubernetes.io/part-of: reality-graph
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

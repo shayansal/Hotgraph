@@ -317,6 +317,59 @@ pub struct DurableCounts {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FollowerStatus {
+    pub leader_last_lsn: u64,
+    pub follower_applied_lsn: u64,
+    pub replay_lag: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FollowerReplicator;
+
+impl FollowerReplicator {
+    pub fn catch_up(
+        leader: &RedbGraphStore,
+        follower: &mut RedbGraphStore,
+        max_lag_lsn: Option<u64>,
+    ) -> Result<FollowerStatus, StorageError> {
+        let leader_last_lsn = leader.last_lsn()?;
+        let follower_start_lsn = follower.last_lsn()?;
+        for lsn in 1..=follower_start_lsn.min(leader_last_lsn) {
+            let leader_event = leader.event_at_lsn(lsn)?.ok_or_else(|| {
+                StorageError::Codec(format!("leader missing committed event at LSN {lsn}"))
+            })?;
+            let follower_event = follower.event_at_lsn(lsn)?.ok_or_else(|| {
+                StorageError::Codec(format!("follower missing applied event at LSN {lsn}"))
+            })?;
+            if encode_event(&leader_event) != encode_event(&follower_event) {
+                return Err(StorageError::Codec(format!(
+                    "follower diverged at LSN {lsn}; manual rebuild required"
+                )));
+            }
+        }
+
+        if follower_start_lsn < leader_last_lsn {
+            for (_, event) in leader.events_by_lsn(follower_start_lsn + 1, leader_last_lsn)? {
+                follower.append_event(&event, None)?;
+            }
+        }
+
+        let follower_applied_lsn = follower.last_lsn()?;
+        let replay_lag = leader_last_lsn.saturating_sub(follower_applied_lsn);
+        if max_lag_lsn.is_some_and(|max_lag| replay_lag > max_lag) {
+            return Err(StorageError::Codec(format!(
+                "follower replay lag {replay_lag} exceeds configured maximum"
+            )));
+        }
+        Ok(FollowerStatus {
+            leader_last_lsn,
+            follower_applied_lsn,
+            replay_lag,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MigrationRecord {
     pub version: u32,
     pub name: String,
@@ -3807,6 +3860,60 @@ mod tests {
         assert_eq!(second.fencing_token, 2);
 
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn redb_follower_replication_catches_up_from_committed_leader_lsns() {
+        let leader_path = temp_file("redb-leader");
+        let follower_path = temp_file("redb-follower");
+        let mut leader = RedbGraphStore::create(&leader_path).expect("create leader");
+        let mut follower = RedbGraphStore::create(&follower_path).expect("create follower");
+        for event in sample_events() {
+            leader
+                .append_event(&event, None)
+                .expect("append leader event");
+        }
+
+        let status = FollowerReplicator::catch_up(&leader, &mut follower, Some(0))
+            .expect("follower catches up");
+
+        assert_eq!(status.leader_last_lsn, 4);
+        assert_eq!(status.follower_applied_lsn, 4);
+        assert_eq!(status.replay_lag, 0);
+        assert_eq!(
+            deterministic_state_hash(&leader.materialized_storage().expect("leader state")),
+            deterministic_state_hash(&follower.materialized_storage().expect("follower state"))
+        );
+
+        fs::remove_file(leader_path).expect("cleanup leader");
+        fs::remove_file(follower_path).expect("cleanup follower");
+    }
+
+    #[test]
+    fn redb_follower_replication_rejects_divergent_existing_lsn() {
+        let leader_path = temp_file("redb-leader-divergent");
+        let follower_path = temp_file("redb-follower-divergent");
+        let mut leader = RedbGraphStore::create(&leader_path).expect("create leader");
+        let mut follower = RedbGraphStore::create(&follower_path).expect("create follower");
+        let leader_events = sample_events();
+        for event in &leader_events {
+            leader
+                .append_event(event, None)
+                .expect("append leader event");
+        }
+        follower
+            .append_event(&leader_events[1], None)
+            .expect("append divergent follower event");
+
+        let error = FollowerReplicator::catch_up(&leader, &mut follower, None)
+            .expect_err("divergent follower must be rejected");
+
+        assert!(
+            matches!(error, StorageError::Codec(message) if message.contains("diverged at LSN 1"))
+        );
+
+        fs::remove_file(leader_path).expect("cleanup leader");
+        fs::remove_file(follower_path).expect("cleanup follower");
     }
 
     #[test]
