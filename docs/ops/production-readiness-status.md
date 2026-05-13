@@ -31,33 +31,47 @@ gates so the project does not drift from evidence-backed readiness.
   redb store, restore into a clean redb target directory, and verify restored
   state hash/query parity.
 - API node-role configuration exists for writer and reader modes. Reader mode
-  requires `HOTGRAPH_WRITER_URL` and rejects local writes with a stable
-  `writer_required` error until writer proxying and follower tailing are wired.
-- Redb follower catch-up can replay committed leader LSNs into a follower store
-  and rejects divergent existing LSNs.
+  requires `HOTGRAPH_WRITER_URL`, can proxy writes to the writer over HTTP, can
+  call the writer replication endpoint, and can apply serialized replication
+  batches to its local redb follower store.
+- Redb follower catch-up can replay committed leader LSNs into a follower store,
+  exposes network-serializable replication batches, enforces in-order LSN
+  application, and rejects divergent existing LSNs.
 - Confidential mode uses `XChaCha20Poly1305` AEAD for record/envelope
   encryption, includes authenticated associated data, and has tests for
   tamper, wrong-key, wrong-purpose, source-store, event-log, snapshot, and key
   rotation behavior.
 - Production envelope construction rejects the deterministic local development
   KMS provider.
+- `AwsKmsProvider` is wired to the AWS Rust SDK behind the `aws-kms` feature,
+  with a mockable `AwsKmsClient` boundary and tests for data-key generation,
+  unwrap, health check, and production envelope use.
+- Governance enforcement now filters source fetches, assertion fetches, graph
+  queries, path results, entity state assertions, evidence packs, and AI context
+  packs for source ACL and redaction checks in the main API crate.
+- Prometheus metrics include durable last/applied LSN, follower lag, writer
+  lease status, and API latency histograms. Kubernetes Prometheus rules and
+  Grafana panels exist for the first production SLO signals.
+- Release-gate data structures now exist for crash-recovery matrix artifacts
+  and 10M/50M/100M benchmark artifacts so CI/release checks can reject fake or
+  incomplete evidence.
 
 ## Blocking Evidence Still Required
 
-- Crash/power-failure fault injection has targeted unit coverage, but not a
-  process-level kill matrix for append, fsync, index update, compaction, and
-  snapshot finalization.
+- Crash/power-failure fault injection now has an explicit required matrix and
+  machine-checkable report contract, but real process-kill/power-loss artifacts
+  still must be produced by nightly/stress infrastructure.
 - Disk-full and torn-write simulation are not wired to CI. They require a
   controlled filesystem or fault-injection layer.
-- The KMS trait and AWS KMS adapter boundary exist, but the repository does not
-  yet call the AWS SDK or prove hosted workload identity/IAM behavior.
+- The AWS KMS SDK adapter compiles under the `aws-kms` feature, but hosted
+  workload identity/IAM behavior still requires deployment evidence.
 - The redb backend is implemented as v0.1, but it still needs process-level
   crash testing, full API query-path coverage, and scale evidence before it can
   be called production-ready.
-- Multi-replica API mode has a node-role boundary and storage-level catch-up,
-  but network follower tailing, write-proxying, stale-reader rejection,
-  lease-expiry failover, and split-brain prevention are still blocking evidence
-  items.
+- Multi-replica API mode has a node-role boundary, network write proxying,
+  serialized follower batches, and catch-up endpoints. Stale-reader production
+  routing, lease-expiry failover drills, and split-brain prevention evidence
+  remain blocking evidence items.
 - 10M, 50M, and 100M benchmark artifacts have not been produced.
 - Penetration test, monthly restore drill, dirty-data pilot, and adversarial
   real-data pilot require external operational evidence.

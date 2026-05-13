@@ -75,6 +75,113 @@ pub const SINGLE_NODE_MVP_TARGETS: BenchmarkTargets = BenchmarkTargets {
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductionScaleEnvelope {
+    PrivateBeta10M,
+    PaidPilot50M,
+    GeneralProduction100M,
+}
+
+impl ProductionScaleEnvelope {
+    pub fn required_assertions(self) -> usize {
+        match self {
+            Self::PrivateBeta10M => 10_000_000,
+            Self::PaidPilot50M => 50_000_000,
+            Self::GeneralProduction100M => 100_000_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BenchmarkArtifact {
+    pub scale: ProductionScaleEnvelope,
+    pub commit_sha: String,
+    pub image_digest: String,
+    pub hardware_profile: String,
+    pub dataset_seed: u64,
+    pub assertion_count: usize,
+    pub write_p50_ms: f64,
+    pub write_p95_ms: f64,
+    pub write_p99_ms: f64,
+    pub query_p50_ms: f64,
+    pub query_p95_ms: f64,
+    pub query_p99_ms: f64,
+    pub evidence_pack_p95_ms: f64,
+    pub replay_time_ms: u64,
+    pub restore_time_ms: u64,
+    pub rss_mb: u64,
+    pub disk_amplification: f64,
+    pub compaction_pause_ms: u64,
+}
+
+impl BenchmarkArtifact {
+    pub fn missing_release_fields(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.commit_sha.trim().len() < 7 {
+            missing.push("commit_sha");
+        }
+        if !self.image_digest.starts_with("sha256:") {
+            missing.push("image_digest");
+        }
+        if self.hardware_profile.trim().is_empty() {
+            missing.push("hardware_profile");
+        }
+        if self.assertion_count < self.scale.required_assertions() {
+            missing.push("assertion_count");
+        }
+        if self.write_p95_ms <= 0.0 {
+            missing.push("write_p95_ms");
+        }
+        if self.query_p95_ms <= 0.0 {
+            missing.push("query_p95_ms");
+        }
+        if self.evidence_pack_p95_ms <= 0.0 {
+            missing.push("evidence_pack_p95_ms");
+        }
+        if self.restore_time_ms == 0 {
+            missing.push("restore_time_ms");
+        }
+        if self.rss_mb == 0 {
+            missing.push("rss_mb");
+        }
+        if self.disk_amplification <= 0.0 {
+            missing.push("disk_amplification");
+        }
+        missing
+    }
+
+    pub fn passes_release_gate(&self) -> bool {
+        self.missing_release_fields().is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BenchmarkReleaseSet {
+    pub artifacts: Vec<BenchmarkArtifact>,
+}
+
+impl BenchmarkReleaseSet {
+    pub fn missing_scales(&self) -> Vec<ProductionScaleEnvelope> {
+        [
+            ProductionScaleEnvelope::PrivateBeta10M,
+            ProductionScaleEnvelope::PaidPilot50M,
+            ProductionScaleEnvelope::GeneralProduction100M,
+        ]
+        .into_iter()
+        .filter(|scale| {
+            !self
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.scale == *scale && artifact.passes_release_gate())
+        })
+        .collect()
+    }
+
+    pub fn passes_production_release_gate(&self) -> bool {
+        self.missing_scales().is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyntheticGraphKind {
     Social,
     CompanyOwnership,
@@ -607,6 +714,66 @@ mod tests {
             SyntheticGraphConfig::mvp_target().assertion_count,
             1_000_000
         );
+    }
+
+    #[test]
+    fn production_benchmark_release_gate_requires_10m_50m_and_100m_artifacts() {
+        let incomplete_artifact = BenchmarkArtifact {
+            scale: ProductionScaleEnvelope::GeneralProduction100M,
+            commit_sha: "abc".to_owned(),
+            image_digest: "not-a-digest".to_owned(),
+            hardware_profile: String::new(),
+            dataset_seed: 42,
+            assertion_count: 1_000,
+            write_p50_ms: 1.0,
+            write_p95_ms: 0.0,
+            write_p99_ms: 2.0,
+            query_p50_ms: 1.0,
+            query_p95_ms: 0.0,
+            query_p99_ms: 2.0,
+            evidence_pack_p95_ms: 0.0,
+            replay_time_ms: 1,
+            restore_time_ms: 0,
+            rss_mb: 0,
+            disk_amplification: 0.0,
+            compaction_pause_ms: 0,
+        };
+        assert!(incomplete_artifact
+            .missing_release_fields()
+            .contains(&"assertion_count"));
+        assert!(!incomplete_artifact.passes_release_gate());
+
+        let artifacts = [
+            ProductionScaleEnvelope::PrivateBeta10M,
+            ProductionScaleEnvelope::PaidPilot50M,
+            ProductionScaleEnvelope::GeneralProduction100M,
+        ]
+        .into_iter()
+        .map(|scale| BenchmarkArtifact {
+            scale,
+            commit_sha: "abcdef1".to_owned(),
+            image_digest: "sha256:benchmark-image".to_owned(),
+            hardware_profile: "c7i.4xlarge-32gb".to_owned(),
+            dataset_seed: 42,
+            assertion_count: scale.required_assertions(),
+            write_p50_ms: 10.0,
+            write_p95_ms: 20.0,
+            write_p99_ms: 40.0,
+            query_p50_ms: 5.0,
+            query_p95_ms: 30.0,
+            query_p99_ms: 60.0,
+            evidence_pack_p95_ms: 250.0,
+            replay_time_ms: 1_000,
+            restore_time_ms: 2_000,
+            rss_mb: 8_192,
+            disk_amplification: 1.4,
+            compaction_pause_ms: 100,
+        })
+        .collect();
+        let release = BenchmarkReleaseSet { artifacts };
+
+        assert!(release.passes_production_release_gate());
+        assert!(release.missing_scales().is_empty());
     }
 
     #[test]

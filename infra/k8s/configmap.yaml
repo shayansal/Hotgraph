@@ -24,6 +24,9 @@ data:
       scrape_interval: 15s
       evaluation_interval: 15s
 
+    rule_files:
+      - /etc/prometheus/hotgraph-alerts.yml
+
     scrape_configs:
       - job_name: reality-graph-api
         metrics_path: /v1/metrics
@@ -41,6 +44,43 @@ data:
         static_configs:
           - targets:
               - localhost:9090
+
+  hotgraph-alerts.yml: |
+    groups:
+      - name: hotgraph-production-gates
+        rules:
+          - alert: HotgraphApiDown
+            expr: up{job="reality-graph-api"} == 0
+            for: 2m
+            labels:
+              severity: critical
+              runbook: docs/ops/runbooks/api-readiness.md
+            annotations:
+              summary: Reality Graph API target is down.
+          - alert: HotgraphHighQueryLatency
+            expr: histogram_quantile(0.95, sum(rate(rg_api_request_duration_seconds_bucket{operation="query"}[10m])) by (le)) > 0.5
+            for: 10m
+            labels:
+              severity: warning
+              runbook: docs/ops/runbooks/high-query-latency.md
+            annotations:
+              summary: Query p95 latency is above the pilot SLO.
+          - alert: HotgraphFollowerLag
+            expr: rg_replication_lag_lsn > 0
+            for: 5m
+            labels:
+              severity: warning
+              runbook: docs/ops/runbooks/follower-lag.md
+            annotations:
+              summary: Reader follower is behind the writer.
+          - alert: HotgraphWriterLeaseMissing
+            expr: rg_writer_lease_active == 0
+            for: 2m
+            labels:
+              severity: critical
+              runbook: docs/ops/runbooks/writer-failover.md
+            annotations:
+              summary: Writer lease metadata is missing.
 ---
 apiVersion: v1
 kind: ConfigMap

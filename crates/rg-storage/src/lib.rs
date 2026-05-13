@@ -14,6 +14,7 @@ use rg_events::{
     MemoryId, MemoryStatus, MemoryType, PredicateId, PropertyKey, PropertyMap, Source, SourceAdded,
     SourceId, SourceType, TimeInterval, TxTime, ValidTime,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum StorageError {
@@ -323,6 +324,154 @@ pub struct FollowerStatus {
     pub replay_lag: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicationRecord {
+    pub lsn: u64,
+    pub encoded_record: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct ReplicationBatch {
+    pub leader_last_lsn: u64,
+    pub records: Vec<ReplicationRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+pub enum FaultInjectionPoint {
+    BeforeWalAppend,
+    AfterWriteBeforeFsync,
+    AfterFsyncBeforeMaterialization,
+    DuringIndexUpdate,
+    DuringSnapshotWrite,
+    DuringSnapshotRename,
+    DuringCompaction,
+    DuringBackupUpload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+pub enum StorageFaultKind {
+    ProcessKill,
+    PowerLoss,
+    DiskFull,
+    PartialWrite,
+    TornWrite,
+    CorruptedTailRecord,
+    CorruptedMiddleRecord,
+    DuplicateLsn,
+    OutOfOrderSegment,
+    StaleSnapshotWithWalTail,
+    MissingMaterializedRow,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
+pub struct FaultInjectionCase {
+    pub point: FaultInjectionPoint,
+    pub fault: StorageFaultKind,
+}
+
+impl FaultInjectionCase {
+    pub fn new(point: FaultInjectionPoint, fault: StorageFaultKind) -> Self {
+        Self { point, fault }
+    }
+
+    pub fn id(&self) -> String {
+        format!("{:?}:{:?}", self.point, self.fault)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct FaultInjectionOutcome {
+    pub case: FaultInjectionCase,
+    pub passed: bool,
+    pub process_level: bool,
+    pub state_hash_before: String,
+    pub state_hash_after: String,
+    pub notes: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct CrashRecoveryMatrixReport {
+    pub commit_sha: String,
+    pub image_digest: String,
+    pub outcomes: Vec<FaultInjectionOutcome>,
+}
+
+impl CrashRecoveryMatrixReport {
+    pub fn missing_required_cases(&self) -> Vec<FaultInjectionCase> {
+        let observed = self
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.case.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        FaultInjectionMatrix::production_required()
+            .required_cases
+            .into_iter()
+            .filter(|case| !observed.contains(case))
+            .collect()
+    }
+
+    pub fn passes_release_gate(&self) -> bool {
+        self.commit_sha.trim().len() >= 7
+            && self.image_digest.starts_with("sha256:")
+            && self.missing_required_cases().is_empty()
+            && self.outcomes.iter().all(|outcome| {
+                outcome.passed
+                    && outcome.process_level
+                    && !outcome.state_hash_before.is_empty()
+                    && outcome.state_hash_before == outcome.state_hash_after
+            })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FaultInjectionMatrix {
+    pub required_cases: Vec<FaultInjectionCase>,
+}
+
+impl FaultInjectionMatrix {
+    pub fn production_required() -> Self {
+        use FaultInjectionPoint as Point;
+        use StorageFaultKind as Fault;
+        Self {
+            required_cases: vec![
+                FaultInjectionCase::new(Point::BeforeWalAppend, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::AfterWriteBeforeFsync, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::AfterFsyncBeforeMaterialization, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::DuringIndexUpdate, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::DuringSnapshotWrite, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::DuringSnapshotRename, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::DuringCompaction, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::DuringBackupUpload, Fault::ProcessKill),
+                FaultInjectionCase::new(Point::AfterWriteBeforeFsync, Fault::PowerLoss),
+                FaultInjectionCase::new(Point::DuringSnapshotWrite, Fault::DiskFull),
+                FaultInjectionCase::new(Point::AfterWriteBeforeFsync, Fault::PartialWrite),
+                FaultInjectionCase::new(Point::AfterWriteBeforeFsync, Fault::TornWrite),
+                FaultInjectionCase::new(
+                    Point::AfterFsyncBeforeMaterialization,
+                    Fault::CorruptedTailRecord,
+                ),
+                FaultInjectionCase::new(
+                    Point::AfterFsyncBeforeMaterialization,
+                    Fault::CorruptedMiddleRecord,
+                ),
+                FaultInjectionCase::new(
+                    Point::AfterFsyncBeforeMaterialization,
+                    Fault::DuplicateLsn,
+                ),
+                FaultInjectionCase::new(
+                    Point::AfterFsyncBeforeMaterialization,
+                    Fault::OutOfOrderSegment,
+                ),
+                FaultInjectionCase::new(
+                    Point::DuringSnapshotRename,
+                    Fault::StaleSnapshotWithWalTail,
+                ),
+                FaultInjectionCase::new(Point::DuringIndexUpdate, Fault::MissingMaterializedRow),
+            ],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FollowerReplicator;
 
@@ -524,6 +673,76 @@ impl RedbGraphStore {
             output.push((lsn, decoded.event));
         }
         Ok(output)
+    }
+
+    pub fn replication_batch_after(
+        &self,
+        after_lsn: u64,
+        limit: usize,
+    ) -> Result<ReplicationBatch, StorageError> {
+        let leader_last_lsn = self.last_lsn()?;
+        let limit = limit.max(1) as u64;
+        let start_lsn = after_lsn.saturating_add(1);
+        if start_lsn > leader_last_lsn {
+            return Ok(ReplicationBatch {
+                leader_last_lsn,
+                records: Vec::new(),
+            });
+        }
+        let end_lsn = leader_last_lsn.min(start_lsn.saturating_add(limit).saturating_sub(1));
+        let read_txn = self.database.begin_read().map_err(redb_error)?;
+        let events = read_txn.open_table(REDB_EVENTS).map_err(redb_error)?;
+        let mut records = Vec::new();
+        for row in events.range(start_lsn..=end_lsn).map_err(redb_error)? {
+            let (lsn, value) = row.map_err(redb_error)?;
+            let lsn = lsn.value();
+            let encoded_record = bytes_to_string(value.value())?;
+            decode_event_record(&encoded_record, lsn)?;
+            records.push(ReplicationRecord {
+                lsn,
+                encoded_record,
+            });
+        }
+        Ok(ReplicationBatch {
+            leader_last_lsn,
+            records,
+        })
+    }
+
+    pub fn apply_replication_batch(
+        &mut self,
+        batch: &ReplicationBatch,
+        max_lag_lsn: Option<u64>,
+    ) -> Result<FollowerStatus, StorageError> {
+        for record in &batch.records {
+            let expected_lsn = self.last_lsn()?.saturating_add(1);
+            if record.lsn != expected_lsn {
+                return Err(StorageError::Codec(format!(
+                    "replication record LSN {} is out of order; expected next LSN {expected_lsn}",
+                    record.lsn
+                )));
+            }
+            let decoded = decode_event_record(&record.encoded_record, record.lsn)?;
+            if decoded.sequence != record.lsn {
+                return Err(StorageError::Codec(format!(
+                    "replication record encoded sequence {} does not match envelope LSN {}",
+                    decoded.sequence, record.lsn
+                )));
+            }
+            self.append_event(&decoded.event, decoded.idempotency_key.as_deref())?;
+        }
+        let follower_applied_lsn = self.last_lsn()?;
+        let replay_lag = batch.leader_last_lsn.saturating_sub(follower_applied_lsn);
+        if max_lag_lsn.is_some_and(|max_lag| replay_lag > max_lag) {
+            return Err(StorageError::Codec(format!(
+                "follower replay lag {replay_lag} exceeds configured maximum"
+            )));
+        }
+        Ok(FollowerStatus {
+            leader_last_lsn: batch.leader_last_lsn,
+            follower_applied_lsn,
+            replay_lag,
+        })
     }
 
     pub fn materialized_storage(&self) -> Result<InMemoryStorage, StorageError> {
@@ -3914,6 +4133,97 @@ mod tests {
 
         fs::remove_file(leader_path).expect("cleanup leader");
         fs::remove_file(follower_path).expect("cleanup follower");
+    }
+
+    #[test]
+    fn redb_replication_batches_are_network_serializable_and_apply_only_in_order() {
+        let leader_path = temp_file("redb-leader-batch");
+        let follower_path = temp_file("redb-follower-batch");
+        let mut leader = RedbGraphStore::create(&leader_path).expect("create leader");
+        let mut follower = RedbGraphStore::create(&follower_path).expect("create follower");
+        for event in sample_events() {
+            leader
+                .append_event(&event, None)
+                .expect("append leader event");
+        }
+
+        let batch = leader
+            .replication_batch_after(0, 2)
+            .expect("read first network batch");
+        assert_eq!(batch.leader_last_lsn, 4);
+        assert_eq!(batch.records.len(), 2);
+
+        let status = follower
+            .apply_replication_batch(&batch, Some(2))
+            .expect("apply first network batch");
+        assert_eq!(status.follower_applied_lsn, 2);
+        assert_eq!(status.replay_lag, 2);
+
+        let stale_error = follower
+            .apply_replication_batch(&batch, None)
+            .expect_err("duplicate network batch must not be silently accepted");
+        assert!(
+            matches!(stale_error, StorageError::Codec(message) if message.contains("expected next LSN 3"))
+        );
+
+        let second = leader
+            .replication_batch_after(status.follower_applied_lsn, 100)
+            .expect("read second network batch");
+        let caught_up = follower
+            .apply_replication_batch(&second, Some(0))
+            .expect("apply second network batch");
+        assert_eq!(caught_up.replay_lag, 0);
+        assert_eq!(
+            deterministic_state_hash(&leader.materialized_storage().expect("leader state")),
+            deterministic_state_hash(&follower.materialized_storage().expect("follower state"))
+        );
+
+        fs::remove_file(leader_path).expect("cleanup leader");
+        fs::remove_file(follower_path).expect("cleanup follower");
+    }
+
+    #[test]
+    fn crash_recovery_matrix_release_gate_requires_every_process_level_fault_case() {
+        let matrix = FaultInjectionMatrix::production_required();
+        assert!(matrix.required_cases.len() >= 18);
+        assert!(matrix
+            .required_cases
+            .iter()
+            .any(|case| case.fault == StorageFaultKind::DiskFull));
+        assert!(matrix
+            .required_cases
+            .iter()
+            .any(|case| case.fault == StorageFaultKind::TornWrite));
+
+        let incomplete = CrashRecoveryMatrixReport {
+            commit_sha: "abcdef1".to_owned(),
+            image_digest: "sha256:test".to_owned(),
+            outcomes: Vec::new(),
+        };
+        assert!(!incomplete.passes_release_gate());
+        assert_eq!(
+            incomplete.missing_required_cases(),
+            matrix.required_cases.clone()
+        );
+
+        let complete = CrashRecoveryMatrixReport {
+            commit_sha: "abcdef1".to_owned(),
+            image_digest: "sha256:test".to_owned(),
+            outcomes: matrix
+                .required_cases
+                .iter()
+                .cloned()
+                .map(|case| FaultInjectionOutcome {
+                    case,
+                    passed: true,
+                    process_level: true,
+                    state_hash_before: "state-hash".to_owned(),
+                    state_hash_after: "state-hash".to_owned(),
+                    notes: "verified by process harness".to_owned(),
+                })
+                .collect(),
+        };
+        assert!(complete.passes_release_gate());
     }
 
     #[test]

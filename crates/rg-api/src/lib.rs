@@ -23,6 +23,7 @@ use rg_core::{
     TxTime, ValidTime,
 };
 use rg_events::{AddAssertion, AddSource, CreateEntity, EventLog, GraphCommand, GraphCommandError};
+use rg_governance::{AccessDenial, AuditReason, GovernanceEngine, Principal, PrincipalId};
 use rg_ingest::{
     DeterministicFixtureExtractor, DocumentId, DocumentInput, IngestionPipeline, LineChunker,
 };
@@ -30,11 +31,13 @@ use rg_query::{
     EntityPattern, GraphQuery, ObjectPattern, PathQuery, PredicatePattern, QueryEngine, QueryResult,
 };
 use rg_storage::{
-    DurableAssertionQuery, FileEventLog, InMemoryStorage, RedbGraphStore, StorageError,
-    WalAppendMetadata,
+    DurableAssertionQuery, FileEventLog, FollowerStatus, InMemoryStorage, RedbGraphStore,
+    ReplicationBatch, StorageError, WalAppendMetadata,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tracing::{info, instrument, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -98,6 +101,7 @@ pub struct ApiState {
     durable_store: Option<Arc<Mutex<RedbGraphStore>>>,
     node_role: NodeRole,
     auth: Arc<AuthConfig>,
+    governance: Option<Arc<Mutex<GovernanceEngine>>>,
     idempotency: Arc<Mutex<BTreeMap<String, IdempotencyRecord>>>,
     idempotency_path: Option<Arc<PathBuf>>,
     slow_query_threshold: Duration,
@@ -107,6 +111,7 @@ pub struct ApiState {
     max_path_depth: usize,
     request_timeout: Duration,
     metrics: Arc<Mutex<ApiMetrics>>,
+    replication_api_key: Option<Arc<String>>,
 }
 
 impl ApiState {
@@ -118,6 +123,7 @@ impl ApiState {
             durable_store: None,
             node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
+            governance: None,
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
             slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
@@ -127,6 +133,7 @@ impl ApiState {
             max_path_depth: DEFAULT_MAX_PATH_DEPTH,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             metrics: Arc::new(Mutex::new(ApiMetrics::default())),
+            replication_api_key: None,
         }
     }
 
@@ -139,6 +146,7 @@ impl ApiState {
             durable_store: None,
             node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
+            governance: None,
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
             slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
@@ -148,6 +156,7 @@ impl ApiState {
             max_path_depth: DEFAULT_MAX_PATH_DEPTH,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             metrics: Arc::new(Mutex::new(ApiMetrics::default())),
+            replication_api_key: None,
         }
     }
 
@@ -163,6 +172,7 @@ impl ApiState {
             durable_store: None,
             node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
+            governance: None,
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
             slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
@@ -172,6 +182,7 @@ impl ApiState {
             max_path_depth: DEFAULT_MAX_PATH_DEPTH,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             metrics: Arc::new(Mutex::new(ApiMetrics::default())),
+            replication_api_key: None,
         })
     }
 
@@ -195,6 +206,7 @@ impl ApiState {
             durable_store: Some(Arc::new(Mutex::new(store))),
             node_role: NodeRole::Writer,
             auth: Arc::new(AuthConfig::disabled()),
+            governance: None,
             idempotency: Arc::new(Mutex::new(BTreeMap::new())),
             idempotency_path: None,
             slow_query_threshold: DEFAULT_SLOW_QUERY_THRESHOLD,
@@ -204,6 +216,7 @@ impl ApiState {
             max_path_depth: DEFAULT_MAX_PATH_DEPTH,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             metrics: Arc::new(Mutex::new(ApiMetrics::default())),
+            replication_api_key: None,
         })
     }
 
@@ -229,6 +242,9 @@ impl ApiState {
                 .with_idempotency_path(PathBuf::from(path))
                 .map_err(ApiConfigError::from)?;
         }
+        if let Ok(api_key) = std::env::var("HOTGRAPH_REPLICATION_API_KEY") {
+            state = state.with_replication_api_key(api_key);
+        }
 
         match std::env::var("RG_API_KEYS") {
             Ok(value) => {
@@ -253,6 +269,61 @@ impl ApiState {
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.auth = Arc::new(auth);
         self
+    }
+
+    pub fn with_governance(mut self, governance: GovernanceEngine) -> Self {
+        self.governance = Some(Arc::new(Mutex::new(governance)));
+        self
+    }
+
+    pub fn with_reader_role(
+        mut self,
+        writer_url: impl Into<String>,
+        max_lag_lsn: Option<u64>,
+    ) -> Self {
+        self.node_role = NodeRole::Reader {
+            writer_url: writer_url.into(),
+            max_lag_lsn,
+        };
+        self
+    }
+
+    pub fn with_replication_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.replication_api_key = Some(Arc::new(api_key.into()));
+        self
+    }
+
+    fn is_reader(&self) -> bool {
+        matches!(self.node_role, NodeRole::Reader { .. })
+    }
+
+    async fn proxy_json_to_writer<T, R>(
+        &self,
+        endpoint: &str,
+        headers: &HeaderMap,
+        body: &T,
+    ) -> Result<R, ApiError>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        let NodeRole::Reader { writer_url, .. } = &self.node_role else {
+            return Err(ApiError::internal("write proxy called on writer node"));
+        };
+        let api_key = headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok());
+        let idempotency_key = headers
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok());
+        simple_http_json(
+            "POST",
+            &format!("{}{}", writer_url.trim_end_matches('/'), endpoint),
+            api_key,
+            idempotency_key,
+            Some(body),
+        )
+        .await
     }
 
     pub fn with_idempotency_path(mut self, path: impl AsRef<FsPath>) -> Result<Self, StorageError> {
@@ -485,6 +556,61 @@ impl ApiState {
         Ok(QueryEngine::from_storage(storage).execute_graph(query))
     }
 
+    fn governance_principal(&self, context: &RequestContext) -> Option<Principal> {
+        context.principal.as_ref().map(|principal| Principal {
+            id: PrincipalId::new(principal.service_account_id.clone()),
+            tenant_id: principal.tenant_id.clone(),
+            agent_id: None,
+        })
+    }
+
+    fn source_access_denial(
+        &self,
+        context: &RequestContext,
+        source_id: &SourceId,
+    ) -> Result<Option<AccessDenial>, ApiError> {
+        let Some(governance) = &self.governance else {
+            return Ok(None);
+        };
+        let Some(principal) = self.governance_principal(context) else {
+            return Ok(None);
+        };
+        Ok(governance
+            .lock()
+            .map_err(|_| ApiError::internal("governance lock poisoned"))?
+            .check_source_access(&principal, source_id))
+    }
+
+    fn governance_allows_sources(
+        &self,
+        context: &RequestContext,
+        source_ids: &[SourceId],
+    ) -> Result<bool, ApiError> {
+        for source_id in source_ids {
+            if self.source_access_denial(context, source_id)?.is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn filter_query_results_for_governance(
+        &self,
+        context: &RequestContext,
+        mut results: Vec<QueryResult>,
+    ) -> Result<Vec<QueryResult>, ApiError> {
+        if self.governance.is_none() {
+            return Ok(results);
+        }
+        let mut allowed = Vec::new();
+        for result in results.drain(..) {
+            if self.governance_allows_sources(context, &result.source_ids)? {
+                allowed.push(result);
+            }
+        }
+        Ok(allowed)
+    }
+
     fn health_snapshot(&self) -> Result<HealthResponse, ApiError> {
         let metrics = self.metrics_snapshot()?;
         if let Some(durable_store) = &self.durable_store {
@@ -514,6 +640,7 @@ impl ApiState {
             .lock()
             .map_err(|_| ApiError::internal("metrics lock poisoned"))?
             .prometheus_histograms();
+        let durable = self.durable_prometheus_metrics()?;
         Ok(format!(
             "# HELP rg_graph_events_total Total events appended to the Reality Graph log.\n\
              # TYPE rg_graph_events_total counter\n\
@@ -533,12 +660,40 @@ impl ApiState {
              # HELP rg_graph_index_health Index health status, where 1 is healthy.\n\
              # TYPE rg_graph_index_health gauge\n\
              rg_graph_index_health 1\n\
-             {latency}",
+             {latency}\
+             {durable}",
             metrics.events,
             metrics.entities,
             metrics.assertions,
             metrics.sources,
             metrics.agent_memories
+        ))
+    }
+
+    fn durable_prometheus_metrics(&self) -> Result<String, ApiError> {
+        let Some(durable_store) = &self.durable_store else {
+            return Ok(String::new());
+        };
+        let health = durable_store
+            .lock()
+            .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+            .health()
+            .map_err(ApiError::from)?;
+        let lease_active = usize::from(health.writer_lease.is_some());
+        Ok(format!(
+            "# HELP rg_storage_last_lsn Last committed durable storage LSN.\n\
+             # TYPE rg_storage_last_lsn gauge\n\
+             rg_storage_last_lsn {}\n\
+             # HELP rg_storage_applied_lsn Last locally applied durable storage LSN.\n\
+             # TYPE rg_storage_applied_lsn gauge\n\
+             rg_storage_applied_lsn {}\n\
+             # HELP rg_replication_lag_lsn Durable follower replay lag in LSNs.\n\
+             # TYPE rg_replication_lag_lsn gauge\n\
+             rg_replication_lag_lsn {}\n\
+             # HELP rg_writer_lease_active Writer lease active flag, where 1 means present.\n\
+             # TYPE rg_writer_lease_active gauge\n\
+             rg_writer_lease_active {}\n",
+            health.last_lsn, health.applied_lsn, health.replay_lag, lease_active
         ))
     }
 
@@ -554,6 +709,77 @@ impl ApiState {
             .lock()
             .map_err(|_| ApiError::internal("event log lock poisoned"))?;
         Ok(TxTime::new(log.events().len() as i64))
+    }
+
+    fn replication_events_after(
+        &self,
+        after_lsn: u64,
+        limit: usize,
+    ) -> Result<ReplicationBatch, ApiError> {
+        let Some(durable_store) = &self.durable_store else {
+            return Err(ApiError::bad_request(
+                "replication events require RG_REDB_PATH-backed storage",
+            ));
+        };
+        durable_store
+            .lock()
+            .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+            .replication_batch_after(after_lsn, limit)
+            .map_err(ApiError::from)
+    }
+
+    fn apply_replication_batch(
+        &self,
+        batch: &ReplicationBatch,
+        max_lag_lsn: Option<u64>,
+    ) -> Result<ReplicationStatusResponse, ApiError> {
+        let Some(durable_store) = &self.durable_store else {
+            return Err(ApiError::bad_request(
+                "replication apply requires RG_REDB_PATH-backed storage",
+            ));
+        };
+        let status = durable_store
+            .lock()
+            .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+            .apply_replication_batch(batch, max_lag_lsn)
+            .map_err(ApiError::from)?;
+        Ok(ReplicationStatusResponse::from(status))
+    }
+
+    async fn catch_up_from_writer(&self) -> Result<ReplicationStatusResponse, ApiError> {
+        let NodeRole::Reader {
+            writer_url,
+            max_lag_lsn,
+        } = &self.node_role
+        else {
+            return Err(ApiError::bad_request(
+                "replication catch-up is only valid on reader nodes",
+            ));
+        };
+        let Some(durable_store) = &self.durable_store else {
+            return Err(ApiError::bad_request(
+                "replication catch-up requires RG_REDB_PATH-backed storage",
+            ));
+        };
+        let after_lsn = durable_store
+            .lock()
+            .map_err(|_| ApiError::internal("durable graph store lock poisoned"))?
+            .health()
+            .map_err(ApiError::from)?
+            .applied_lsn;
+        let api_key = self.replication_api_key.as_deref().map(String::as_str);
+        let batch: ReplicationBatch = simple_http_json::<(), ReplicationBatch>(
+            "GET",
+            &format!(
+                "{}/v1/admin/replication/events?after_lsn={after_lsn}&limit=1000",
+                writer_url.trim_end_matches('/')
+            ),
+            api_key,
+            None,
+            None,
+        )
+        .await?;
+        self.apply_replication_batch(&batch, *max_lag_lsn)
     }
 }
 
@@ -677,6 +903,140 @@ fn append_idempotency_record(
     writeln!(file, "{line}").map_err(|error| StorageError::Io(error.to_string()))?;
     file.sync_data()
         .map_err(|error| StorageError::Io(error.to_string()))
+}
+
+async fn simple_http_json<T, R>(
+    method: &str,
+    url: &str,
+    api_key: Option<&str>,
+    idempotency_key: Option<&str>,
+    body: Option<&T>,
+) -> Result<R, ApiError>
+where
+    T: Serialize,
+    R: DeserializeOwned,
+{
+    let (host, path) = parse_http_url(url)?;
+    let serialized_body = body
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| ApiError::internal(format!("serialize proxy request: {error}")))?;
+    let body_text = serialized_body.as_deref().unwrap_or("");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: application/json\r\n"
+    );
+    if let Some(api_key) = api_key {
+        request.push_str(&format!("x-api-key: {api_key}\r\n"));
+    }
+    if let Some(idempotency_key) = idempotency_key {
+        request.push_str(&format!("idempotency-key: {idempotency_key}\r\n"));
+    }
+    if body.is_some() {
+        request.push_str("content-type: application/json\r\n");
+        request.push_str(&format!("content-length: {}\r\n", body_text.len()));
+    }
+    request.push_str("\r\n");
+    request.push_str(body_text);
+
+    let mut stream = TcpStream::connect(host)
+        .await
+        .map_err(|error| ApiError::writer_required(format!("connect writer: {error}")))?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| ApiError::writer_required(format!("write writer request: {error}")))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|error| ApiError::writer_required(format!("finish writer request: {error}")))?;
+    let response = read_http_response(&mut stream)
+        .await
+        .map_err(|error| ApiError::writer_required(format!("read writer response: {error}")))?;
+    let (head, response_body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| ApiError::writer_required("writer returned malformed HTTP response"))?;
+    if !head.starts_with("HTTP/1.1 2") && !head.starts_with("HTTP/1.0 2") {
+        if let Ok(error) = serde_json::from_str::<ErrorResponse>(response_body) {
+            return Err(ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                code: "writer_proxy_failed",
+                message: format!("writer rejected proxied request: {}", error.error),
+            });
+        }
+        return Err(ApiError::writer_required(format!(
+            "writer returned non-success response: {head}"
+        )));
+    }
+    serde_json::from_str(response_body)
+        .map_err(|error| ApiError::internal(format!("decode writer response: {error}")))
+}
+
+fn parse_http_url(url: &str) -> Result<(&str, String), ApiError> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .ok_or_else(|| ApiError::bad_request("only http:// writer URLs are supported"))?;
+    let (host, path) = without_scheme
+        .split_once('/')
+        .map(|(host, path)| (host, format!("/{path}")))
+        .unwrap_or((without_scheme, "/".to_owned()));
+    if host.trim().is_empty() {
+        return Err(ApiError::bad_request("writer URL host must not be empty"));
+    }
+    Ok((host, path))
+}
+
+async fn read_http_response(stream: &mut TcpStream) -> Result<String, std::io::Error> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer)).await {
+            Err(_) if !bytes.is_empty() => break,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for HTTP response",
+                ))
+            }
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                if response_has_complete_body(&bytes) {
+                    break;
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn response_has_complete_body(bytes: &[u8]) -> bool {
+    let Some(header_end) = find_header_end(bytes) else {
+        return false;
+    };
+    let header = String::from_utf8_lossy(&bytes[..header_end]);
+    let body_len = bytes.len().saturating_sub(header_end + 4);
+    for line in header.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .is_ok_and(|expected| body_len >= expected);
+        }
+        if name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            return bytes.ends_with(b"\r\n0\r\n\r\n") || bytes.ends_with(b"0\r\n\r\n");
+        }
+    }
+    false
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 pub trait QuestionEmbeddingProvider {
@@ -1042,6 +1402,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/metrics", get(prometheus_metrics))
         .route("/v1/metrics.json", get(metrics_json))
         .route("/v1/openapi.json", get(openapi_endpoint))
+        .route("/v1/admin/replication/events", get(replication_events))
+        .route("/v1/admin/replication/apply", post(replication_apply))
+        .route("/v1/admin/replication/catch-up", post(replication_catch_up))
         .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
         .layer(middleware::from_fn_with_state(
             timeout_state,
@@ -1144,6 +1507,9 @@ fn required_role(method: &Method, path: &str) -> Option<ApiRole> {
     if matches!(path, "/v1/health" | "/v1/openapi.json") {
         return None;
     }
+    if path.starts_with("/v1/admin/") {
+        return Some(ApiRole::Admin);
+    }
     if method == Method::GET {
         return Some(ApiRole::Reader);
     }
@@ -1228,6 +1594,13 @@ async fn create_entity(
     headers: HeaderMap,
     Json(request): Json<CreateEntityRequest>,
 ) -> Result<Json<EntityResponse>, ApiError> {
+    if state.is_reader() {
+        return Ok(Json(
+            state
+                .proxy_json_to_writer("/v1/entities", &headers, &request)
+                .await?,
+        ));
+    }
     let command = create_entity_command(request);
     let entity_id = command.id.clone();
     state.execute(
@@ -1253,6 +1626,13 @@ async fn add_source(
     headers: HeaderMap,
     Json(request): Json<CreateSourceRequest>,
 ) -> Result<Json<SourceResponse>, ApiError> {
+    if state.is_reader() {
+        return Ok(Json(
+            state
+                .proxy_json_to_writer("/v1/sources", &headers, &request)
+                .await?,
+        ));
+    }
     let source_id = source_id_from_request(&request);
     let command = add_source_command(request, source_id.clone())?;
     let event = state.execute(GraphCommand::AddSource(command), idempotency_key(&headers)?)?;
@@ -1278,6 +1658,13 @@ async fn add_assertion(
     headers: HeaderMap,
     Json(request): Json<AddAssertionRequest>,
 ) -> Result<Json<AssertionResponse>, ApiError> {
+    if state.is_reader() {
+        return Ok(Json(
+            state
+                .proxy_json_to_writer("/v1/assertions", &headers, &request)
+                .await?,
+        ));
+    }
     let assertion_id = assertion_id_from_request(&request);
     let command = add_assertion_command(request, assertion_id.clone(), context.tenant_context())?;
     state.execute(
@@ -1304,6 +1691,13 @@ async fn post_event(
     headers: HeaderMap,
     Json(request): Json<PostEventRequest>,
 ) -> Result<Json<EventResponse>, ApiError> {
+    if state.is_reader() {
+        return Ok(Json(
+            state
+                .proxy_json_to_writer("/v1/events", &headers, &request)
+                .await?,
+        ));
+    }
     let command = graph_command_from_envelope(request.command, context.tenant_context())?;
     let event = state.execute(command, idempotency_key(&headers)?)?;
     Ok(Json(EventResponse::from(&event)))
@@ -1323,10 +1717,13 @@ async fn execute_query(
 ) -> Result<Json<QueryResponse>, ApiError> {
     let start = Instant::now();
     let results = state
-        .execute_graph_query(graph_query_from_request(
-            state.apply_query_limits(request)?,
-            context.tenant_context(),
-        )?)?
+        .filter_query_results_for_governance(
+            &context,
+            state.execute_graph_query(graph_query_from_request(
+                state.apply_query_limits(request)?,
+                context.tenant_context(),
+            )?)?,
+        )?
         .iter()
         .map(QueryResultResponse::from)
         .collect();
@@ -1353,6 +1750,15 @@ async fn execute_path(
     let tenant_context = context.tenant_context();
     let mut paths = engine.execute_path(request.try_into()?);
     retain_paths_for_tenant(&mut paths, tenant_context.as_ref());
+    if state.governance.is_some() {
+        paths.retain(|path| {
+            path.hops.iter().all(|hop| {
+                state
+                    .governance_allows_sources(&context, &hop.source_ids)
+                    .unwrap_or(false)
+            })
+        });
+    }
     let paths = paths.iter().map(PathResultResponse::from).collect();
     log_slow_query(&state, "path_query", start);
     Ok(Json(PathResponse { paths }))
@@ -1395,7 +1801,18 @@ async fn evidence_pack(
             .transpose()?,
         generated_at,
     });
-    let mut response = EvidencePackResponse::from(&pack);
+    let governed_pack = if let (Some(governance), Some(principal)) =
+        (&state.governance, state.governance_principal(&context))
+    {
+        governance
+            .lock()
+            .map_err(|_| ApiError::internal("governance lock poisoned"))?
+            .enforce_evidence_pack_mut(principal, &pack, AuditReason::AiContextPack)
+            .pack
+    } else {
+        pack
+    };
+    let mut response = EvidencePackResponse::from(&governed_pack);
     retain_evidence_response_for_tenant(&mut response, tenant_context.as_ref());
     log_slow_query(&state, "evidence_pack", start);
     Ok(Json(response))
@@ -1443,7 +1860,18 @@ async fn ai_context_pack(
         path_query,
         generated_at: state.generated_tx()?,
     });
-    let mut response = EvidencePackResponse::from(&pack);
+    let governed_pack = if let (Some(governance), Some(principal)) =
+        (&state.governance, state.governance_principal(&context))
+    {
+        governance
+            .lock()
+            .map_err(|_| ApiError::internal("governance lock poisoned"))?
+            .enforce_evidence_pack_mut(principal, &pack, AuditReason::AiContextPack)
+            .pack
+    } else {
+        pack
+    };
+    let mut response = EvidencePackResponse::from(&governed_pack);
     retain_evidence_response_for_tenant(&mut response, tenant_context.as_ref());
     log_slow_query(&state, "ai_context_pack", start);
     Ok(Json(response))
@@ -1523,6 +1951,9 @@ async fn get_entity_state(
             && tenant_context
                 .as_ref()
                 .map_or(true, |context| &assertion.context == context)
+            && state
+                .governance_allows_sources(&context, &assertion.source_ids)
+                .unwrap_or(false)
     });
     assertions.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(Json(EntityStateResponse {
@@ -1556,6 +1987,9 @@ async fn get_assertion(
     {
         return Err(ApiError::not_found(format!("assertion not found: {id}")));
     }
+    if !state.governance_allows_sources(&context, &assertion.source_ids)? {
+        return Err(ApiError::not_found(format!("assertion not found: {id}")));
+    }
     Ok(Json(AssertionResponse::from(assertion)))
 }
 
@@ -1567,11 +2001,16 @@ async fn get_assertion(
 )]
 async fn get_source(
     State(state): State<ApiState>,
+    Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
 ) -> Result<Json<SourceResponse>, ApiError> {
     let storage = state.storage_snapshot()?;
+    let source_id = SourceId::new(id.clone());
+    if state.source_access_denial(&context, &source_id)?.is_some() {
+        return Err(ApiError::not_found(format!("source not found: {id}")));
+    }
     let source = storage
-        .source(&SourceId::new(id.clone()))
+        .source(&source_id)
         .ok_or_else(|| ApiError::not_found(format!("source not found: {id}")))?;
     Ok(Json(SourceResponse::from(source)))
 }
@@ -1617,6 +2056,29 @@ async fn metrics_json(State(state): State<ApiState>) -> Result<Json<MetricsRespo
 )]
 async fn openapi_endpoint() -> Json<utoipa::openapi::OpenApi> {
     Json(openapi())
+}
+
+async fn replication_events(
+    State(state): State<ApiState>,
+    Query(query): Query<ReplicationEventsQuery>,
+) -> Result<Json<ReplicationBatch>, ApiError> {
+    Ok(Json(state.replication_events_after(
+        query.after_lsn.unwrap_or(0),
+        query.limit.unwrap_or(1000),
+    )?))
+}
+
+async fn replication_apply(
+    State(state): State<ApiState>,
+    Json(batch): Json<ReplicationBatch>,
+) -> Result<Json<ReplicationStatusResponse>, ApiError> {
+    Ok(Json(state.apply_replication_batch(&batch, None)?))
+}
+
+async fn replication_catch_up(
+    State(state): State<ApiState>,
+) -> Result<Json<ReplicationStatusResponse>, ApiError> {
+    Ok(Json(state.catch_up_from_writer().await?))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -1732,7 +2194,30 @@ pub struct EntityStateQuery {
     pub valid_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct ReplicationEventsQuery {
+    pub after_lsn: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct ReplicationStatusResponse {
+    pub leader_last_lsn: u64,
+    pub follower_applied_lsn: u64,
+    pub replay_lag: u64,
+}
+
+impl From<FollowerStatus> for ReplicationStatusResponse {
+    fn from(status: FollowerStatus) -> Self {
+        Self {
+            leader_last_lsn: status.leader_last_lsn,
+            follower_applied_lsn: status.follower_applied_lsn,
+            replay_lag: status.replay_lag,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct EntityResponse {
     pub id: String,
     pub entity_type: String,
@@ -1740,7 +2225,7 @@ pub struct EntityResponse {
     pub created_tx: i64,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct SourceResponse {
     pub id: String,
     pub source_type: String,
@@ -1752,7 +2237,7 @@ pub struct SourceResponse {
     pub event_type: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct AssertionResponse {
     pub assertion_id: String,
     pub subject: String,
@@ -1768,7 +2253,7 @@ pub struct AssertionResponse {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct GraphValueResponse {
     pub entity_id: Option<String>,
     pub text: Option<String>,
@@ -1779,7 +2264,7 @@ pub struct GraphValueResponse {
     pub null: bool,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct QueryResultResponse {
     pub assertion_id: String,
     pub subject: String,
@@ -1794,24 +2279,24 @@ pub struct QueryResultResponse {
     pub context: String,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct QueryResponse {
     pub results: Vec<QueryResultResponse>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct PathResultResponse {
     pub start: String,
     pub end: String,
     pub hops: Vec<QueryResultResponse>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct PathResponse {
     pub paths: Vec<PathResultResponse>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct SourceExcerptResponse {
     pub source_id: String,
     pub source_type: String,
@@ -1821,7 +2306,7 @@ pub struct SourceExcerptResponse {
     pub trust_score: Option<f32>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ContradictionResponse {
     pub id: String,
     pub assertion_a: String,
@@ -1831,7 +2316,7 @@ pub struct ContradictionResponse {
     pub explanation: String,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct EvidencePackResponse {
     pub query: String,
     pub entities: Vec<EntityResponse>,
@@ -1842,7 +2327,7 @@ pub struct EvidencePackResponse {
     pub generated_at: i64,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct CandidateAssertionResponse {
     pub subject_text: String,
     pub predicate_text: String,
@@ -1855,33 +2340,33 @@ pub struct CandidateAssertionResponse {
     pub extraction_model: String,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct IngestDocumentResponse {
     pub document_id: String,
     pub candidates: Vec<CandidateAssertionResponse>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct EntityStateResponse {
     pub entity: EntityResponse,
     pub assertions: Vec<AssertionResponse>,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct EventResponse {
     pub event_id: String,
     pub transaction_time: i64,
     pub event_type: String,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: String,
     pub event_log: String,
     pub index_health: IndexHealthResponse,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct IndexHealthResponse {
     pub status: String,
     pub entities: usize,
@@ -1890,7 +2375,7 @@ pub struct IndexHealthResponse {
     pub events: usize,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct MetricsResponse {
     pub entities: usize,
     pub assertions: usize,
@@ -1899,7 +2384,7 @@ pub struct MetricsResponse {
     pub agent_memories: usize,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ErrorResponse {
     pub code: String,
     pub error: String,

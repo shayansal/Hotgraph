@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 redb = "2"
 rg-events = { path = "../rg-events" }
+serde = { version = "1", features = ["derive"] }
 
 [lints]
 workspace = true

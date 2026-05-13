@@ -7,9 +7,17 @@ use rg_api::{
     DeterministicContextPackModelProvider, DeterministicQuestionEmbeddingProvider,
     QuestionEmbeddingProvider, ServiceAccount,
 };
-use rg_storage::FileEventLog;
+use rg_core::{ContentHash, SourceId, SourceType, TenantId, TxTime};
+use rg_events::{AddSource, EventLog, GraphCommand};
+use rg_governance::{
+    GovernanceEngine, PermissionPolicy, PermissionScope, PrincipalId, RedactionEvent,
+    SourceAccessPolicy,
+};
+use rg_storage::{FileEventLog, RedbGraphStore};
 use serde_json::{json, Value};
 use std::fs;
+use std::io::{Read as StdRead, Write as StdWrite};
+use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -405,6 +413,86 @@ async fn durable_api_state_recovers_events_and_idempotency_after_restart() {
     let _ = fs::remove_file(idempotency_path);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reader_nodes_proxy_writes_and_tail_writer_replication_batches() {
+    let reader_path = temp_file("api-reader-redb");
+    let leader_path = temp_file("api-fake-leader-redb");
+    let mut leader = RedbGraphStore::create(&leader_path).expect("leader redb");
+    let mut log = EventLog::new(TxTime::new(0));
+    let source_event = log
+        .execute(GraphCommand::AddSource(AddSource {
+            id: SourceId::new("source-proxied"),
+            source_type: SourceType::Document,
+            uri: None,
+            content_hash: ContentHash::new("sha256:proxied"),
+            trust_score: None,
+        }))
+        .expect("source event");
+    leader
+        .append_event(&source_event, None)
+        .expect("append fake leader event");
+    let batch = leader
+        .replication_batch_after(0, 100)
+        .expect("fake writer replication batch");
+    let (writer_url, fake_writer) = spawn_fake_writer(batch);
+
+    let reader = router(
+        ApiState::from_redb_graph_store(&reader_path)
+            .expect("reader redb state")
+            .with_auth(replication_auth())
+            .with_reader_role(writer_url.clone(), Some(0))
+            .with_replication_api_key("admin-key"),
+    );
+
+    let proxied_response = raw_json(
+        reader.clone(),
+        "POST",
+        "/v1/sources",
+        json!({
+            "id": "source-proxied",
+            "source_type": "Document",
+            "content_hash": "sha256:proxied"
+        }),
+        &[("x-api-key", "writer-key")],
+    )
+    .await;
+    assert_eq!(proxied_response.status(), StatusCode::OK);
+    let proxied = response_json(proxied_response).await;
+    assert_eq!(proxied["id"], "source-proxied");
+
+    let caught_up = raw_empty(
+        reader.clone(),
+        "POST",
+        "/v1/admin/replication/catch-up",
+        &[("x-api-key", "admin-key")],
+    )
+    .await;
+    assert_eq!(caught_up.status(), StatusCode::OK);
+    let caught_up = response_json(caught_up).await;
+    assert_eq!(caught_up["replay_lag"], 0);
+    assert_eq!(caught_up["follower_applied_lsn"], 1);
+
+    let local_source = request_empty_with_headers(
+        reader,
+        "GET",
+        "/v1/sources/source-proxied",
+        &[("x-api-key", "reader-key")],
+    )
+    .await;
+    assert_eq!(local_source["id"], "source-proxied");
+
+    let captured = fake_writer.join().expect("join fake writer");
+    assert!(captured
+        .iter()
+        .any(|request| request.starts_with("POST /v1/sources ")));
+    assert!(captured
+        .iter()
+        .any(|request| request.starts_with("GET /v1/admin/replication/events?")));
+
+    let _ = fs::remove_file(leader_path);
+    let _ = fs::remove_file(reader_path);
+}
+
 #[tokio::test]
 async fn request_limits_query_defaults_and_histograms_are_enforced() {
     let body_limited_app = router(ApiState::new_in_memory().with_max_body_bytes(64).with_auth(
@@ -780,6 +868,120 @@ async fn ai_context_pack_is_reader_scoped_for_authenticated_tenants() {
 }
 
 #[tokio::test]
+async fn governance_redaction_and_source_acl_are_enforced_on_read_paths() {
+    let source_id = SourceId::new("source-governed");
+    let governance = GovernanceEngine::new(
+        PermissionPolicy::new(TenantId::new("tenant-a"))
+            .allow_read(PermissionScope::Tenant(TenantId::new("tenant-a")))
+            .with_source_policy(SourceAccessPolicy::restricted(
+                source_id.clone(),
+                vec![PrincipalId::new("writer-service")],
+            ))
+            .with_redaction(RedactionEvent::source(
+                source_id.clone(),
+                PrincipalId::new("privacy-officer"),
+                "right to be forgotten",
+                TxTime::new(99),
+            )),
+    );
+    let app = router(authenticated_state().with_governance(governance));
+
+    request_json_with_headers(
+        app.clone(),
+        "POST",
+        "/v1/entities",
+        json!({"id": "person-governed", "type": "Person", "name": "Person Governed"}),
+        &[("x-api-key", "writer-key")],
+    )
+    .await;
+    request_json_with_headers(
+        app.clone(),
+        "POST",
+        "/v1/entities",
+        json!({"id": "company-governed", "type": "Organization", "name": "Company Governed"}),
+        &[("x-api-key", "writer-key")],
+    )
+    .await;
+    request_json_with_headers(
+        app.clone(),
+        "POST",
+        "/v1/sources",
+        json!({
+            "id": "source-governed",
+            "source_type": "Document",
+            "content_hash": "sha256:governed"
+        }),
+        &[("x-api-key", "writer-key")],
+    )
+    .await;
+    request_json_with_headers(
+        app.clone(),
+        "POST",
+        "/v1/assertions",
+        json!({
+            "id": "assertion-governed",
+            "subject": "person-governed",
+            "predicate": "WORKED_AT",
+            "object": {"entity_id": "company-governed"},
+            "valid_from": "2021-01-01",
+            "valid_to": "2025-01-01",
+            "confidence": 0.92,
+            "sources": ["source-governed"]
+        }),
+        &[("x-api-key", "writer-key")],
+    )
+    .await;
+
+    let source_fetch = raw_empty(
+        app.clone(),
+        "GET",
+        "/v1/sources/source-governed",
+        &[("x-api-key", "reader-key")],
+    )
+    .await;
+    assert_eq!(source_fetch.status(), StatusCode::NOT_FOUND);
+
+    let query = request_json_with_headers(
+        app.clone(),
+        "POST",
+        "/v1/query",
+        json!({
+            "predicate": "WORKED_AT",
+            "valid_at": "2024-01-01",
+            "min_confidence": 0.8,
+            "limit": 10
+        }),
+        &[("x-api-key", "reader-key")],
+    )
+    .await;
+    let assertion_ids = query["results"]
+        .as_array()
+        .expect("query results")
+        .iter()
+        .map(|result| result["assertion_id"].as_str().expect("assertion id"))
+        .collect::<Vec<_>>();
+    assert!(!assertion_ids.contains(&"assertion-governed"));
+
+    let pack = request_json_with_headers(
+        app,
+        "POST",
+        "/v1/evidence-pack",
+        json!({
+            "query": "Where did the governed person work?",
+            "graph_query": {
+                "subject": {"entity_id": "person-governed"},
+                "predicate": "WORKED_AT",
+                "valid_at": "2024-01-01"
+            }
+        }),
+        &[("x-api-key", "reader-key")],
+    )
+    .await;
+    assert_eq!(pack["assertions"].as_array().expect("assertions").len(), 0);
+    assert_eq!(pack["sources"].as_array().expect("sources").len(), 0);
+}
+
+#[tokio::test]
 async fn api_server_supports_graceful_shutdown() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -810,14 +1012,17 @@ async fn request_json_with_headers(
 }
 
 async fn request_empty(app: axum::Router, method: &str, uri: &str) -> Value {
+    request_empty_with_headers(app, method, uri, &[]).await
+}
+
+async fn request_empty_with_headers(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> Value {
     let response = app
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(uri)
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(empty_request(method, uri, headers))
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
@@ -825,6 +1030,17 @@ async fn request_empty(app: axum::Router, method: &str, uri: &str) -> Value {
         .await
         .expect("body");
     serde_json::from_slice(&bytes).expect("json body")
+}
+
+async fn raw_empty(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    app.oneshot(empty_request(method, uri, headers))
+        .await
+        .expect("response")
 }
 
 async fn request_text_with_headers(
@@ -905,6 +1121,111 @@ fn authenticated_state() -> ApiState {
             ),
         ]))
         .with_slow_query_threshold(Duration::from_secs(10))
+}
+
+fn replication_auth() -> AuthConfig {
+    AuthConfig::new(vec![
+        ServiceAccount::new(
+            "writer-key",
+            "writer-service",
+            "tenant-a",
+            vec![ApiRole::Reader, ApiRole::Writer],
+        ),
+        ServiceAccount::new(
+            "reader-key",
+            "reader-service",
+            "tenant-a",
+            vec![ApiRole::Reader],
+        ),
+        ServiceAccount::new(
+            "admin-key",
+            "admin-service",
+            "tenant-a",
+            vec![ApiRole::Admin],
+        ),
+    ])
+}
+
+fn spawn_fake_writer(
+    batch: rg_storage::ReplicationBatch,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake writer");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("fake writer addr")
+    );
+    let handle = std::thread::spawn(move || {
+        let mut captured = Vec::new();
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.expect("accept fake writer connection");
+            let request = read_blocking_http_request(&mut stream);
+            let response_body = if request.starts_with("POST /v1/sources ") {
+                json!({
+                    "id": "source-proxied",
+                    "source_type": "Document",
+                    "uri": null,
+                    "content_hash": "sha256:proxied",
+                    "observed_at": 1,
+                    "trust_score": null,
+                    "event_type": "source_added"
+                })
+            } else if request.starts_with("GET /v1/admin/replication/events?") {
+                serde_json::to_value(&batch).expect("serialize replication batch")
+            } else {
+                json!({"code": "not_found", "error": "unexpected fake writer request"})
+            };
+            captured.push(request);
+            write_blocking_http_json(&mut stream, &response_body);
+        }
+        captured
+    });
+    (url, handle)
+}
+
+fn read_blocking_http_request(stream: &mut StdTcpStream) -> String {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("fake writer read timeout");
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).expect("read fake writer request");
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if blocking_http_message_complete(&bytes) {
+            break;
+        }
+    }
+    String::from_utf8(bytes).expect("utf8 request")
+}
+
+fn write_blocking_http_json(stream: &mut StdTcpStream, body: &Value) {
+    let body = body.to_string();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .expect("write fake writer response");
+}
+
+fn blocking_http_message_complete(bytes: &[u8]) -> bool {
+    let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let header = String::from_utf8_lossy(&bytes[..header_end]);
+    let body_len = bytes.len().saturating_sub(header_end + 4);
+    let content_length = header.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    content_length.map_or(true, |expected| body_len >= expected)
 }
 
 fn temp_file(name: &str) -> PathBuf {

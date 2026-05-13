@@ -37,6 +37,39 @@
           "expr": "rg_graph_index_health"
         }
       ]
+    },
+    {
+      "type": "stat",
+      "title": "Follower Lag (LSN)",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "rg_replication_lag_lsn"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "API Query Latency p95",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(rg_api_request_duration_seconds_bucket{operation=\"query\"}[5m])) by (le))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Write Latency p95",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "Prometheus" },
+          "expr": "histogram_quantile(0.95, sum(rate(rg_api_request_duration_seconds_bucket{operation=\"write\"}[5m])) by (le))"
+        }
+      ]
     }
   ]
 }

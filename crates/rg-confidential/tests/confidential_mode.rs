@@ -8,6 +8,10 @@ use rg_confidential::{
     LocalDevKmsProvider, PrivacyAnalyticsQuery, PrivateAnalyticsEngine, RedactionAwareQueryEngine,
     TenantKey,
 };
+#[cfg(feature = "aws-kms")]
+use rg_confidential::{
+    AwsGeneratedDataKey, AwsKmsClient, AwsKmsProvider, EncryptedDataKey, KmsProvider,
+};
 use rg_core::{
     Assertion, AssertionId, AssertionStatus, Confidence, ContentHash, ContextScope, Entity,
     EntityId, EntityType, GraphValue, PredicateId, PropertyMap, SourceId, SourceType, TenantId,
@@ -106,6 +110,76 @@ fn production_envelope_encryptor_rejects_local_development_kms() {
     assert!(
         matches!(error, rg_confidential::ConfidentialError::Codec(message) if message.contains("LocalDevKmsProvider"))
     );
+}
+
+#[cfg(feature = "aws-kms")]
+#[test]
+fn aws_kms_provider_uses_sdk_client_for_data_key_unwrap_health_and_rotation() {
+    #[derive(Clone, Debug)]
+    struct MockAwsClient {
+        key_id: String,
+    }
+
+    impl AwsKmsClient for MockAwsClient {
+        fn generate_data_key(
+            &self,
+            key_id: &str,
+            tenant_id: &str,
+            purpose: &str,
+        ) -> Result<AwsGeneratedDataKey, rg_confidential::ConfidentialError> {
+            assert_eq!(key_id, self.key_id);
+            assert_eq!(tenant_id, "tenant-a");
+            assert_eq!(purpose, "event-log");
+            Ok(AwsGeneratedDataKey {
+                plaintext: [42; 32],
+                ciphertext_blob: b"aws-kms-ciphertext".to_vec(),
+            })
+        }
+
+        fn decrypt_data_key(
+            &self,
+            key_id: &str,
+            tenant_id: &str,
+            purpose: &str,
+            encrypted: &EncryptedDataKey,
+        ) -> Result<[u8; 32], rg_confidential::ConfidentialError> {
+            assert_eq!(key_id, self.key_id);
+            assert_eq!(tenant_id, "tenant-a");
+            assert_eq!(purpose, "event-log");
+            assert_eq!(encrypted.ciphertext, b"aws-kms-ciphertext");
+            Ok([42; 32])
+        }
+
+        fn describe_key(&self, key_id: &str) -> Result<(), rg_confidential::ConfidentialError> {
+            assert_eq!(key_id, self.key_id);
+            Ok(())
+        }
+    }
+
+    let provider = AwsKmsProvider::with_client(
+        "arn:aws:kms:us-east-1:123456789012:key/hotgraph",
+        "us-east-1",
+        MockAwsClient {
+            key_id: "arn:aws:kms:us-east-1:123456789012:key/hotgraph".to_owned(),
+        },
+    );
+    let encryptor = EnvelopeEncryptor::new_production(provider.clone())
+        .expect("AWS KMS provider is accepted for production");
+
+    let envelope = encryptor
+        .encrypt("tenant-a", "event-log", b"production secret")
+        .expect("encrypt with AWS KMS client");
+    assert_eq!(
+        envelope.encrypted_data_key.key_id,
+        KeyId::new("arn:aws:kms:us-east-1:123456789012:key/hotgraph")
+    );
+    assert_eq!(
+        encryptor
+            .decrypt("tenant-a", "event-log", &envelope)
+            .expect("decrypt with AWS KMS client"),
+        b"production secret"
+    );
+    assert_eq!(provider.key_metadata().provider, "aws-kms:us-east-1");
 }
 
 #[test]

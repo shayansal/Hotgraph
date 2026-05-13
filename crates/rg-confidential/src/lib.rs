@@ -249,17 +249,163 @@ impl KmsProvider for LocalDevKmsProvider {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg(feature = "aws-kms")]
-pub struct AwsKmsProvider {
-    key_id: KeyId,
-    region: String,
+pub struct AwsGeneratedDataKey {
+    pub plaintext: [u8; 32],
+    pub ciphertext_blob: Vec<u8>,
 }
 
 #[cfg(feature = "aws-kms")]
-impl AwsKmsProvider {
-    pub fn new(key_id: impl Into<String>, region: impl Into<String>) -> Self {
+pub trait AwsKmsClient: Clone {
+    fn generate_data_key(
+        &self,
+        key_id: &str,
+        tenant_id: &str,
+        purpose: &str,
+    ) -> Result<AwsGeneratedDataKey, ConfidentialError>;
+
+    fn decrypt_data_key(
+        &self,
+        key_id: &str,
+        tenant_id: &str,
+        purpose: &str,
+        encrypted: &EncryptedDataKey,
+    ) -> Result<[u8; 32], ConfidentialError>;
+
+    fn describe_key(&self, key_id: &str) -> Result<(), ConfidentialError>;
+}
+
+#[derive(Clone, Debug)]
+#[cfg(feature = "aws-kms")]
+pub struct AwsSdkKmsClient {
+    client: aws_sdk_kms::Client,
+}
+
+#[cfg(feature = "aws-kms")]
+impl AwsSdkKmsClient {
+    pub fn new(client: aws_sdk_kms::Client) -> Self {
+        Self { client }
+    }
+
+    pub fn from_env(region: impl Into<Option<String>>) -> Result<Self, ConfidentialError> {
+        let region = region.into();
+        let config = block_on_aws(async move {
+            let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+            if let Some(region) = region {
+                loader = loader.region(aws_config::Region::new(region));
+            }
+            loader.load().await
+        });
+        Ok(Self::new(aws_sdk_kms::Client::new(&config)))
+    }
+}
+
+#[cfg(feature = "aws-kms")]
+impl AwsKmsClient for AwsSdkKmsClient {
+    fn generate_data_key(
+        &self,
+        key_id: &str,
+        tenant_id: &str,
+        purpose: &str,
+    ) -> Result<AwsGeneratedDataKey, ConfidentialError> {
+        let response = block_on_aws(
+            self.client
+                .generate_data_key()
+                .key_id(key_id)
+                .key_spec(aws_sdk_kms::types::DataKeySpec::Aes256)
+                .encryption_context("tenant_id", tenant_id)
+                .encryption_context("purpose", purpose)
+                .send(),
+        )
+        .map_err(|error| {
+            ConfidentialError::Codec(format!("aws kms generate_data_key failed: {error}"))
+        })?;
+        let plaintext = response
+            .plaintext()
+            .ok_or_else(|| {
+                ConfidentialError::Codec("aws kms data key response omitted plaintext".to_owned())
+            })?
+            .as_ref();
+        let ciphertext_blob = response
+            .ciphertext_blob()
+            .ok_or_else(|| {
+                ConfidentialError::Codec("aws kms data key response omitted ciphertext".to_owned())
+            })?
+            .as_ref()
+            .to_vec();
+        Ok(AwsGeneratedDataKey {
+            plaintext: data_key_from_slice(plaintext)?,
+            ciphertext_blob,
+        })
+    }
+
+    fn decrypt_data_key(
+        &self,
+        key_id: &str,
+        tenant_id: &str,
+        purpose: &str,
+        encrypted: &EncryptedDataKey,
+    ) -> Result<[u8; 32], ConfidentialError> {
+        let response = block_on_aws(
+            self.client
+                .decrypt()
+                .key_id(key_id)
+                .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(
+                    encrypted.ciphertext.clone(),
+                ))
+                .encryption_context("tenant_id", tenant_id)
+                .encryption_context("purpose", purpose)
+                .send(),
+        )
+        .map_err(|error| ConfidentialError::Codec(format!("aws kms decrypt failed: {error}")))?;
+        let plaintext = response
+            .plaintext()
+            .ok_or_else(|| {
+                ConfidentialError::Codec("aws kms decrypt response omitted plaintext".to_owned())
+            })?
+            .as_ref();
+        data_key_from_slice(plaintext)
+    }
+
+    fn describe_key(&self, key_id: &str) -> Result<(), ConfidentialError> {
+        block_on_aws(self.client.describe_key().key_id(key_id).send())
+            .map(|_| ())
+            .map_err(|error| {
+                ConfidentialError::Codec(format!("aws kms describe_key failed: {error}"))
+            })
+    }
+}
+
+#[derive(Clone, Debug)]
+#[cfg(feature = "aws-kms")]
+pub struct AwsKmsProvider<C: AwsKmsClient = AwsSdkKmsClient> {
+    key_id: KeyId,
+    region: String,
+    client: C,
+}
+
+#[cfg(feature = "aws-kms")]
+impl AwsKmsProvider<AwsSdkKmsClient> {
+    pub fn new(
+        key_id: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Result<Self, ConfidentialError> {
+        let region = region.into();
+        let client = AwsSdkKmsClient::from_env(Some(region.clone()))?;
+        Ok(Self {
+            key_id: KeyId::new(key_id),
+            region,
+            client,
+        })
+    }
+}
+
+#[cfg(feature = "aws-kms")]
+impl<C: AwsKmsClient> AwsKmsProvider<C> {
+    pub fn with_client(key_id: impl Into<String>, region: impl Into<String>, client: C) -> Self {
         Self {
             key_id: KeyId::new(key_id),
             region: region.into(),
+            client,
         }
     }
 
@@ -269,28 +415,35 @@ impl AwsKmsProvider {
 }
 
 #[cfg(feature = "aws-kms")]
-impl KmsProvider for AwsKmsProvider {
+impl<C: AwsKmsClient> KmsProvider for AwsKmsProvider<C> {
     fn create_data_key(
         &self,
-        _tenant_id: &str,
-        _purpose: &str,
+        tenant_id: &str,
+        purpose: &str,
     ) -> Result<([u8; 32], EncryptedDataKey), ConfidentialError> {
-        Err(ConfidentialError::Codec(
-            "AwsKmsProvider is a production adapter boundary; wire aws-sdk-kms in deployment code"
-                .to_owned(),
+        let generated = self
+            .client
+            .generate_data_key(self.key_id.as_str(), tenant_id, purpose)?;
+        Ok((
+            generated.plaintext,
+            EncryptedDataKey {
+                key_id: self.key_id.clone(),
+                ciphertext: generated.ciphertext_blob,
+            },
         ))
     }
 
     fn decrypt_data_key(
         &self,
-        _tenant_id: &str,
-        _purpose: &str,
-        _encrypted: &EncryptedDataKey,
+        tenant_id: &str,
+        purpose: &str,
+        encrypted: &EncryptedDataKey,
     ) -> Result<[u8; 32], ConfidentialError> {
-        Err(ConfidentialError::Codec(
-            "AwsKmsProvider is a production adapter boundary; wire aws-sdk-kms in deployment code"
-                .to_owned(),
-        ))
+        if encrypted.key_id != self.key_id {
+            return Err(ConfidentialError::MissingKey(encrypted.key_id.clone()));
+        }
+        self.client
+            .decrypt_data_key(self.key_id.as_str(), tenant_id, purpose, encrypted)
     }
 
     fn rotate_key(&mut self, new_key_id: impl Into<String>) -> Result<KeyId, ConfidentialError> {
@@ -306,8 +459,27 @@ impl KmsProvider for AwsKmsProvider {
     }
 
     fn health_check(&self) -> Result<(), ConfidentialError> {
-        Ok(())
+        self.client.describe_key(self.key_id.as_str())
     }
+}
+
+#[cfg(feature = "aws-kms")]
+fn data_key_from_slice(bytes: &[u8]) -> Result<[u8; 32], ConfidentialError> {
+    bytes.try_into().map_err(|_| {
+        ConfidentialError::Codec(format!(
+            "AWS KMS data key must be 32 bytes, got {} bytes",
+            bytes.len()
+        ))
+    })
+}
+
+#[cfg(feature = "aws-kms")]
+fn block_on_aws<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build AWS KMS runtime")
+        .block_on(future)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

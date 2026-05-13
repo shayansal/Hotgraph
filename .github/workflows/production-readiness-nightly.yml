@@ -25,8 +25,14 @@ jobs:
       - name: Run WAL, snapshot, and restore tests
         run: cargo test -p rg-storage --locked -- --nocapture
 
+      - name: Run crash matrix gate contract tests
+        run: cargo test -p rg-storage --locked crash_recovery_matrix_release_gate_requires_every_process_level_fault_case -- --nocapture
+
       - name: Run API durable-state tests
         run: cargo test -p rg-api --test http_api --locked -- --nocapture
+
+      - name: Run AWS KMS adapter contract tests
+        run: cargo test -p rg-confidential --features aws-kms --locked aws_kms_provider_uses_sdk_client_for_data_key_unwrap_health_and_rotation -- --nocapture
 
   benchmark-smoke:
     name: Benchmark smoke artifact

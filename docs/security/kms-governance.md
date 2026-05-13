@@ -22,9 +22,12 @@ Implemented boundary:
 - `LocalDevKmsProvider` is deterministic and intended only for tests,
   development, and reproducible fixtures. `EnvelopeEncryptor::new_production`
   rejects it.
-- `AwsKmsProvider` reserves the production adapter surface behind the
-  `aws-kms` feature; hosted production still requires wiring the AWS SDK,
-  workload identity/IAM policy, and deployment-time health checks.
+- `AwsKmsProvider` is implemented behind the `aws-kms` feature using the AWS
+  Rust SDK. It calls `GenerateDataKey`, `Decrypt`, and `DescribeKey` with
+  tenant/purpose encryption context.
+- The AWS adapter has a mockable `AwsKmsClient` boundary for deterministic unit
+  tests. Hosted production still requires workload identity/IAM policy,
+  deployment-time health checks, and a real key-rotation drill.
 
 ## Secret Provenance
 
